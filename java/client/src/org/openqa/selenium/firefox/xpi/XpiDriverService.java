@@ -62,6 +62,10 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Supplier;
 import java.util.stream.Stream;
 
+/**
+ * @deprecated This class will not be replaced.
+ */
+@Deprecated
 public class XpiDriverService extends FirefoxDriverService {
 
   private static final String NO_FOCUS_LIBRARY_NAME = "x_ignore_nofocus.so";
@@ -93,14 +97,19 @@ public class XpiDriverService extends FirefoxDriverService {
 
     String firefoxLogFile = System.getProperty(FirefoxDriver.SystemProperty.BROWSER_LOGFILE);
     if (firefoxLogFile != null) { // System property has higher precedence
-      if ("/dev/stdout".equals(firefoxLogFile)) {
-        sendOutputTo(System.out);
-      } else if ("/dev/stderr".equals(firefoxLogFile)) {
-        sendOutputTo(System.err);
-      } else if ("/dev/null".equals(firefoxLogFile)) {
-        sendOutputTo(ByteStreams.nullOutputStream());
-      } else {
-        sendOutputTo(new FileOutputStream(firefoxLogFile));
+      switch (firefoxLogFile) {
+        case "/dev/stdout":
+          sendOutputTo(System.out);
+          break;
+        case "/dev/stderr":
+          sendOutputTo(System.err);
+          break;
+        case "/dev/null":
+          sendOutputTo(ByteStreams.nullOutputStream());
+          break;
+        default:
+          sendOutputTo(new FileOutputStream(firefoxLogFile));
+          break;
       }
     } else {
       if (logFile != null) {

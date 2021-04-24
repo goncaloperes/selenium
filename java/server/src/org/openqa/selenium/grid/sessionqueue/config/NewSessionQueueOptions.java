@@ -18,18 +18,16 @@
 package org.openqa.selenium.grid.sessionqueue.config;
 
 import org.openqa.selenium.grid.config.Config;
+import org.openqa.selenium.grid.config.ConfigException;
 import org.openqa.selenium.grid.sessionqueue.NewSessionQueue;
 
-import java.time.Duration;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.util.Optional;
 
 public class NewSessionQueueOptions {
 
-  private static final String SESSIONS_QUEUE_SECTION = "sessionqueue";
-  private static final String DEFAULT_NEWSESSION_QUEUE =
-    "org.openqa.selenium.grid.sessionmap.remote.LocalNewSessionQueue";
-  private static final int DEFAULT_REQUEST_TIMEOUT = 300;
-  private static final int DEFAULT_RETRY_INTERVAL = 5;
-
+  static final String SESSION_QUEUE_SECTION = "sessionqueue";
 
   private final Config config;
 
@@ -37,29 +35,45 @@ public class NewSessionQueueOptions {
     this.config = config;
   }
 
-  public Duration getSessionRequestTimeout() {
-    int timeout = config.getInt(SESSIONS_QUEUE_SECTION, "session-request-timeout")
-      .orElse(DEFAULT_REQUEST_TIMEOUT);
+  public URI getSessionQueueUri() {
 
-    if (timeout <= 0) {
-      return Duration.ofSeconds(DEFAULT_REQUEST_TIMEOUT);
+    Optional<URI> host = config.get(SESSION_QUEUE_SECTION, "host").map(str -> {
+      try {
+        return new URI(str);
+      } catch (URISyntaxException e) {
+        throw new ConfigException("Session queue server URI is not a valid URI: " + str);
+      }
+    });
+
+    if (host.isPresent()) {
+      return host.get();
     }
-    return Duration.ofSeconds(timeout);
+
+    Optional<Integer> port = config.getInt(SESSION_QUEUE_SECTION, "port");
+    Optional<String> hostname = config.get(SESSION_QUEUE_SECTION, "hostname");
+
+    if (!(port.isPresent() && hostname.isPresent())) {
+      throw new ConfigException("Unable to determine host and port for the session queue server");
+    }
+
+    try {
+      return new URI(
+        "http",
+        null,
+        hostname.get(),
+        port.get(),
+        "",
+        null,
+        null);
+    } catch (URISyntaxException e) {
+      throw new ConfigException(
+        "Session queue server uri configured through host (%s) and port (%d) is not a valid URI",
+        hostname.get(),
+        port.get());
+    }
   }
 
-  public Duration getSessionRequestRetryInterval() {
-    int interval = config.getInt(SESSIONS_QUEUE_SECTION, "session-retry-interval")
-      .orElse(DEFAULT_RETRY_INTERVAL);
-
-    if (interval <= 0) {
-      return Duration.ofSeconds(DEFAULT_RETRY_INTERVAL);
-    }
-    return Duration.ofSeconds(interval);
-  }
-
-  public NewSessionQueue getSessionQueue() {
-    return config
-      .getClass(SESSIONS_QUEUE_SECTION, "implementation", NewSessionQueue.class,
-        DEFAULT_NEWSESSION_QUEUE);
+  public NewSessionQueue getSessionQueue(String implementation) {
+    return config.getClass(SESSION_QUEUE_SECTION, "implementation", NewSessionQueue.class, implementation);
   }
 }

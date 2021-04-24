@@ -22,10 +22,9 @@ import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
 import static org.openqa.selenium.support.ui.ExpectedConditions.alertIsPresent;
 import static org.openqa.selenium.support.ui.ExpectedConditions.titleIs;
 import static org.openqa.selenium.testing.drivers.Browser.CHROME;
-import static org.openqa.selenium.testing.drivers.Browser.CHROMIUMEDGE;
 import static org.openqa.selenium.testing.drivers.Browser.EDGE;
 import static org.openqa.selenium.testing.drivers.Browser.IE;
-import static org.openqa.selenium.testing.drivers.Browser.MARIONETTE;
+import static org.openqa.selenium.testing.drivers.Browser.FIREFOX;
 import static org.openqa.selenium.testing.drivers.Browser.SAFARI;
 
 import org.junit.Test;
@@ -85,11 +84,10 @@ public class FormHandlingTest extends JUnit4TestBase {
   @Test
   @NotYetImplemented(SAFARI)
   @NotYetImplemented(
-    value = MARIONETTE, reason = "Delegates to JS and so the wrong exception is returned")
-  @NotYetImplemented(EDGE)
+    value = FIREFOX, reason = "Delegates to JS and so the wrong exception is returned")
   @NotYetImplemented(value = IE,
       reason = "Throws JavascriptException: Error from JavaScript: Unable to find owning document")
-  @NotYetImplemented(value = CHROMIUMEDGE,
+  @NotYetImplemented(value = EDGE,
       reason = "Throws JavascriptException: Error from JavaScript: Unable to find owning document")
   @NotYetImplemented(value = CHROME,
       reason = "Throws JavascriptException: Error from JavaScript: Unable to find owning document")
@@ -119,7 +117,7 @@ public class FormHandlingTest extends JUnit4TestBase {
   }
 
   @Test
-  @NotYetImplemented(MARIONETTE)
+  @NotYetImplemented(FIREFOX)
   @NotYetImplemented(SAFARI)
   public void testShouldSubmitAFormUsingTheNewlineLiteral() {
     driver.get(pages.formPage);

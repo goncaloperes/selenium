@@ -24,9 +24,12 @@ import org.openqa.selenium.grid.distributor.Distributor;
 import org.openqa.selenium.grid.security.Secret;
 import org.openqa.selenium.grid.sessionmap.SessionMap;
 import org.openqa.selenium.grid.sessionmap.local.LocalSessionMap;
+import org.openqa.selenium.grid.sessionqueue.local.LocalNewSessionQueue;
 import org.openqa.selenium.remote.http.HttpClient;
 import org.openqa.selenium.remote.tracing.DefaultTestTracer;
 import org.openqa.selenium.remote.tracing.Tracer;
+
+import java.time.Duration;
 
 public class GridModelTest {
 
@@ -35,7 +38,21 @@ public class GridModelTest {
   private final HttpClient.Factory clientFactory = HttpClient.Factory.createDefault();
   private final SessionMap sessions = new LocalSessionMap(tracer, events);
   private final Secret secret = new Secret("cheese");
-  private final Distributor distributor = new LocalDistributor(tracer, events, clientFactory, sessions, secret);
+
+  LocalNewSessionQueue queue = new LocalNewSessionQueue(
+    tracer,
+    events,
+    Duration.ofSeconds(2),
+    Duration.ofSeconds(2),
+    secret);
+  private final Distributor distributor = new LocalDistributor(
+    tracer,
+    events,
+    clientFactory,
+    sessions,
+    queue,
+    secret,
+    Duration.ofMinutes(5));
 
   @Test
   public void shouldNotChangeTheStateOfANodeMarkedAsDownWhenNodeStatusEventFires() {

@@ -17,8 +17,10 @@
 
 package org.openqa.selenium.grid.log;
 
-import com.beust.jcommander.Parameter;
 import com.google.auto.service.AutoService;
+
+import com.beust.jcommander.Parameter;
+
 import org.openqa.selenium.grid.config.ConfigValue;
 import org.openqa.selenium.grid.config.HasRoles;
 import org.openqa.selenium.grid.config.Role;
@@ -26,33 +28,51 @@ import org.openqa.selenium.grid.config.Role;
 import java.util.Set;
 
 import static org.openqa.selenium.grid.config.StandardGridRoles.ALL_ROLES;
+import static org.openqa.selenium.grid.log.LoggingOptions.DEFAULT_CONFIGURE_LOGGING;
+import static org.openqa.selenium.grid.log.LoggingOptions.DEFAULT_LOG_LEVEL;
+import static org.openqa.selenium.grid.log.LoggingOptions.DEFAULT_PLAIN_LOGS;
+import static org.openqa.selenium.grid.log.LoggingOptions.DEFAULT_STRUCTURED_LOGS;
+import static org.openqa.selenium.grid.log.LoggingOptions.DEFAULT_TRACING_ENABLED;
+import static org.openqa.selenium.grid.log.LoggingOptions.LOGGING_SECTION;
 
+@SuppressWarnings("FieldMayBeFinal")
 @AutoService(HasRoles.class)
 public class LoggingFlags implements HasRoles {
 
-  @Parameter(description = "Configure logging", hidden = true, names = "--configure-logging", arity = 1)
-  @ConfigValue(section = "logging", name = "enable", example = "true")
-  private Boolean configureLogging = true;
+  @Parameter(
+    description = "Configure logging",
+    hidden = true,
+    names = "--configure-logging",
+    arity = 1)
+  @ConfigValue(section = LOGGING_SECTION, name = "enable", example = "true")
+  private Boolean configureLogging = DEFAULT_CONFIGURE_LOGGING;
 
-  @Parameter(description = "Use structured logs", names = "--structured-logs")
-  @ConfigValue(section = "logging", name = "structured-logs", example = "false")
-  private Boolean structuredLogs = false;
+  @Parameter(description = "Use structured logs", names = "--structured-logs", arity = 1)
+  @ConfigValue(section = LOGGING_SECTION, name = "structured-logs", example = "false")
+  private Boolean structuredLogs = DEFAULT_STRUCTURED_LOGS;
 
   @Parameter(description = "Use plain log lines", names = "--plain-logs", arity = 1)
-  @ConfigValue(section = "logging", name = "plain-logs", example = "true")
-  private Boolean plainLogs = true;
+  @ConfigValue(section = LOGGING_SECTION, name = "plain-logs", example = "true")
+  private Boolean plainLogs = DEFAULT_PLAIN_LOGS;
 
   @Parameter(description = "Enable trace collection", hidden = true, names = "--tracing", arity = 1)
-  @ConfigValue(section = "logging", name = "tracing", example = "true")
-  private Boolean enableTracing = true;
+  @ConfigValue(section = LOGGING_SECTION, name = "tracing", example = "true")
+  private Boolean enableTracing = DEFAULT_TRACING_ENABLED;
 
-  @Parameter(description = "File to write out logs", hidden = true, names = "--log", arity = 1)
-  @ConfigValue(section = "logging", name = "log-file", example = "true")
+  @Parameter(description = "File to write out logs", names = "--log", arity = 1)
+  @ConfigValue(section = LOGGING_SECTION, name = "log-file", example = "true")
   private String logFile;
 
   @Parameter(description = "Log encoding", names = "--log-encoding", arity = 1)
-  @ConfigValue(section = "logging", name = "log-encoding", example = "UTF-8")
-  private String logEncoding = null;
+  @ConfigValue(section = LOGGING_SECTION, name = "log-encoding", example = "UTF-8")
+  private String logEncoding;
+
+  @Parameter(description =
+    "Log level. Default logging level is INFO. Log levels are described here " +
+    "https://docs.oracle.com/javase/7/docs/api/java/util/logging/Level.html",
+    names = "--log-level", arity = 1)
+  @ConfigValue(section = LOGGING_SECTION, name = "log-level", example = "INFO")
+  private String logLevel = DEFAULT_LOG_LEVEL;
 
   @Override
   public Set<Role> getRoles() {

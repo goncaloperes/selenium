@@ -17,18 +17,22 @@
 
 package org.openqa.selenium.grid.sessionqueue.local;
 
+import org.openqa.selenium.Capabilities;
+import org.openqa.selenium.SessionNotCreatedException;
 import org.openqa.selenium.events.EventBus;
 import org.openqa.selenium.grid.config.Config;
-import org.openqa.selenium.grid.data.NewSessionErrorResponse;
-import org.openqa.selenium.grid.data.NewSessionRejectedEvent;
-import org.openqa.selenium.grid.data.NewSessionRequestEvent;
 import org.openqa.selenium.grid.data.RequestId;
+import org.openqa.selenium.grid.jmx.JMXHelper;
+import org.openqa.selenium.grid.jmx.ManagedAttribute;
+import org.openqa.selenium.grid.jmx.ManagedService;
 import org.openqa.selenium.grid.log.LoggingOptions;
+import org.openqa.selenium.grid.security.Secret;
+import org.openqa.selenium.grid.security.SecretOptions;
 import org.openqa.selenium.grid.server.EventBusOptions;
 import org.openqa.selenium.grid.sessionqueue.NewSessionQueue;
-import org.openqa.selenium.grid.sessionqueue.config.NewSessionQueueOptions;
+import org.openqa.selenium.grid.sessionqueue.SessionRequest;
+import org.openqa.selenium.grid.sessionqueue.config.SessionRequestOptions;
 import org.openqa.selenium.internal.Require;
-import org.openqa.selenium.remote.http.HttpRequest;
 import org.openqa.selenium.remote.http.HttpResponse;
 import org.openqa.selenium.remote.tracing.AttributeKey;
 import org.openqa.selenium.remote.tracing.EventAttribute;
@@ -37,44 +41,84 @@ import org.openqa.selenium.remote.tracing.Span;
 import org.openqa.selenium.remote.tracing.Tracer;
 
 import java.time.Duration;
-import java.util.Deque;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.UUID;
-import java.util.concurrent.ConcurrentLinkedDeque;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReadWriteLock;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
-import java.util.logging.Level;
-import java.util.logging.Logger;
+import java.util.Set;
 
+import static org.openqa.selenium.remote.tracing.Tags.EXCEPTION;
+
+@ManagedService(objectName = "org.seleniumhq.grid:type=SessionQueue,name=LocalSessionQueue",
+  description = "New session queue")
 public class LocalNewSessionQueue extends NewSessionQueue {
 
-  private static final Logger LOG = Logger.getLogger(LocalNewSessionQueue.class.getName());
+  public final SessionRequests sessionRequests;
   private final EventBus bus;
-  private final Deque<HttpRequest> sessionRequests = new ConcurrentLinkedDeque<>();
-  private final ReadWriteLock lock = new ReentrantReadWriteLock(true);
-  private final ScheduledExecutorService executorService = Executors
-    .newSingleThreadScheduledExecutor();
-  private final Thread shutdownHook = new Thread(this::callExecutorShutdown);
+  private final GetNewSessionResponse getNewSessionResponse;
 
-  public LocalNewSessionQueue(Tracer tracer, EventBus bus, Duration retryInterval,
-                              Duration requestTimeout) {
-    super(tracer, retryInterval, requestTimeout);
+  public LocalNewSessionQueue(
+    Tracer tracer,
+    EventBus bus,
+    Duration retryInterval,
+    Duration requestTimeout,
+    Secret registrationSecret) {
+    super(tracer, registrationSecret);
     this.bus = Require.nonNull("Event bus", bus);
-    Runtime.getRuntime().addShutdownHook(shutdownHook);
+
+    this.sessionRequests = new SessionRequests(
+      tracer,
+      bus,
+      Require.nonNull("Retry interval", retryInterval),
+      Require.nonNull("Request timeout", requestTimeout));
+
+    this.getNewSessionResponse  = new GetNewSessionResponse(bus, sessionRequests);
+
+    new JMXHelper().register(this);
   }
 
   public static NewSessionQueue create(Config config) {
     Tracer tracer = new LoggingOptions(config).getTracer();
     EventBus bus = new EventBusOptions(config).getEventBus();
-    Duration retryInterval = new NewSessionQueueOptions(config).getSessionRequestRetryInterval();
-    Duration requestTimeout = new NewSessionQueueOptions(config).getSessionRequestTimeout();
-    return new LocalNewSessionQueue(tracer, bus, retryInterval, requestTimeout);
+    Duration retryInterval = new SessionRequestOptions(config).getSessionRequestRetryInterval();
+    Duration requestTimeout = new SessionRequestOptions(config).getSessionRequestTimeout();
+
+    SecretOptions secretOptions = new SecretOptions(config);
+    Secret registrationSecret = secretOptions.getRegistrationSecret();
+
+    return new LocalNewSessionQueue(tracer, bus, retryInterval, requestTimeout, registrationSecret);
+  }
+
+  @Override
+  public HttpResponse addToQueue(SessionRequest request) {
+    validateSessionRequest(request);
+    return getNewSessionResponse.add(request);
+  }
+
+  @Override
+  public boolean offerLast(SessionRequest request) {
+    Require.nonNull("Session request", request);
+    return sessionRequests.offerLast(request);
+  }
+
+  @Override
+  public boolean retryAddToQueue(SessionRequest request) {
+    return sessionRequests.offerFirst(request);
+  }
+
+  @Override
+  public Optional<SessionRequest> remove(RequestId id) {
+    return sessionRequests.remove(id);
+  }
+
+  @Override
+  public int clearQueue() {
+    return sessionRequests.clear();
+  }
+
+  @Override
+  public List<Set<Capabilities>> getQueueContents() {
+    return sessionRequests.getQueuedRequests();
   }
 
   @Override
@@ -82,123 +126,25 @@ public class LocalNewSessionQueue extends NewSessionQueue {
     return bus.isReady();
   }
 
-  @Override
-  public boolean offerLast(HttpRequest request, RequestId requestId) {
-    Require.nonNull("New Session request", request);
+  @ManagedAttribute(name = "NewSessionQueueSize")
+  public int getQueueSize() {
+    return sessionRequests.getQueueSize();
+  }
 
-    Span span = tracer.getCurrentContext().createSpan("local_sessionqueue.add");
-    boolean added = false;
-
-    Lock writeLock = lock.writeLock();
-    writeLock.lock();
-    try {
+  private void validateSessionRequest(SessionRequest request) {
+    try (Span span = tracer.getCurrentContext().createSpan("newsession_queue.validate")) {
       Map<String, EventAttributeValue> attributeMap = new HashMap<>();
-      attributeMap.put(AttributeKey.LOGGER_CLASS.getKey(),
-        EventAttribute.setValue(getClass().getName()));
 
-
-      added = sessionRequests.offerLast(request);
-      addRequestHeaders(request, requestId);
-
-      attributeMap
-        .put(AttributeKey.REQUEST_ID.getKey(), EventAttribute.setValue(requestId.toString()));
-      attributeMap.put("request.added", EventAttribute.setValue(added));
-      span.addEvent("Add new session request to the queue", attributeMap);
-
-      return added;
-    } finally {
-      writeLock.unlock();
-      span.close();
-      if (added) {
-        bus.fire(new NewSessionRequestEvent(requestId));
+      if (request.getDesiredCapabilities().isEmpty()) {
+        SessionNotCreatedException exception =
+          new SessionNotCreatedException("No capabilities found");
+        EXCEPTION.accept(attributeMap, exception);
+        attributeMap.put(
+          AttributeKey.EXCEPTION_MESSAGE.getKey(), EventAttribute.setValue(exception.getMessage()));
+        span.addEvent(AttributeKey.EXCEPTION_EVENT.getKey(), attributeMap);
+        throw exception;
       }
     }
-  }
-
-  @Override
-  public boolean offerFirst(HttpRequest request, RequestId requestId) {
-    Require.nonNull("New Session request", request);
-    Lock writeLock = lock.writeLock();
-    writeLock.lock();
-    boolean added = false;
-    try {
-      added = sessionRequests.offerFirst(request);
-      return added;
-    } finally {
-      writeLock.unlock();
-      if (added) {
-        executorService.schedule(() -> retryRequest(request, requestId),
-                                 super.retryInterval.getSeconds(), TimeUnit.SECONDS);
-      }
-    }
-  }
-
-  private void retryRequest(HttpRequest request, RequestId requestId) {
-    if (hasRequestTimedOut(request)) {
-      LOG.log(Level.INFO, "Request {0} timed out", requestId);
-      Lock writeLock = lock.writeLock();
-      writeLock.lock();
-      try {
-        sessionRequests.remove();
-      } finally {
-        writeLock.unlock();
-        bus.fire(new NewSessionRejectedEvent(
-            new NewSessionErrorResponse(requestId, "New session request timed out")));
-      }
-    } else {
-      LOG.log(Level.INFO,
-              "Adding request back to the queue. All slots are busy. Request: {0}",
-              requestId);
-      bus.fire(new NewSessionRequestEvent(requestId));
-    }
-  }
-
-  @Override
-  public Optional<HttpRequest> poll() {
-    Lock writeLock = lock.writeLock();
-    writeLock.lock();
-    try {
-      Optional<HttpRequest> request = Optional.ofNullable(sessionRequests.poll());
-      if (request.isPresent()) {
-        HttpRequest httpRequest = request.get();
-        if (hasRequestTimedOut(httpRequest)) {
-          // TODO Fire NewSessionRejectedEvent with timeout message once request id is passed to poll
-          return Optional.empty();
-        }
-        return Optional.of(httpRequest);
-      } else {
-        return Optional.empty();
-      }
-    } finally {
-      writeLock.unlock();
-    }
-  }
-
-  @Override
-  public int clear() {
-    Lock writeLock = lock.writeLock();
-    writeLock.lock();
-    try {
-      int count = 0;
-      LOG.info("Clearing new session request queue");
-      for (HttpRequest request = sessionRequests.poll(); request != null;
-           request = sessionRequests.poll()) {
-        count++;
-        UUID reqId = UUID.fromString(request.getHeader(SESSIONREQUEST_ID_HEADER));
-        NewSessionErrorResponse errorResponse =
-          new NewSessionErrorResponse(new RequestId(reqId), "New session request cancelled.");
-
-        bus.fire(new NewSessionRejectedEvent(errorResponse));
-      }
-      return count;
-    } finally {
-      writeLock.unlock();
-    }
-  }
-
-  public void callExecutorShutdown() {
-    LOG.info("Shutting down session queue executor service");
-    executorService.shutdown();
   }
 }
 

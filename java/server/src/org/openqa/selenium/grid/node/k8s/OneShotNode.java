@@ -24,6 +24,7 @@ import org.openqa.selenium.ImmutableCapabilities;
 import org.openqa.selenium.NoSuchSessionException;
 import org.openqa.selenium.PersistentCapabilities;
 import org.openqa.selenium.WebDriver;
+import org.openqa.selenium.WebDriverException;
 import org.openqa.selenium.WebDriverInfo;
 import org.openqa.selenium.events.EventBus;
 import org.openqa.selenium.grid.config.Config;
@@ -43,8 +44,10 @@ import org.openqa.selenium.grid.node.HealthCheck;
 import org.openqa.selenium.grid.node.Node;
 import org.openqa.selenium.grid.node.config.NodeOptions;
 import org.openqa.selenium.grid.security.Secret;
+import org.openqa.selenium.grid.security.SecretOptions;
 import org.openqa.selenium.grid.server.BaseServerOptions;
 import org.openqa.selenium.grid.server.EventBusOptions;
+import org.openqa.selenium.internal.Either;
 import org.openqa.selenium.internal.Require;
 import org.openqa.selenium.json.Json;
 import org.openqa.selenium.remote.CommandExecutor;
@@ -58,12 +61,11 @@ import org.openqa.selenium.remote.tracing.Tracer;
 import java.lang.reflect.Field;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.time.Duration;
 import java.time.Instant;
-import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.ServiceLoader;
-import java.util.TreeMap;
 import java.util.UUID;
 import java.util.logging.Logger;
 import java.util.stream.StreamSupport;
@@ -88,6 +90,7 @@ public class OneShotNode extends Node {
   private final EventBus events;
   private final WebDriverInfo driverInfo;
   private final Capabilities stereotype;
+  private final Duration heartbeatPeriod;
   private final URI gridUri;
   private final UUID slotId = UUID.randomUUID();
   private RemoteWebDriver driver;
@@ -100,6 +103,7 @@ public class OneShotNode extends Node {
     Tracer tracer,
     EventBus events,
     Secret registrationSecret,
+    Duration heartbeatPeriod,
     NodeId id,
     URI uri,
     URI gridUri,
@@ -107,6 +111,7 @@ public class OneShotNode extends Node {
     WebDriverInfo driverInfo) {
     super(tracer, id, uri, registrationSecret);
 
+    this.heartbeatPeriod = heartbeatPeriod;
     this.events = Require.nonNull("Event bus", events);
     this.gridUri = Require.nonNull("Public Grid URI", gridUri);
     this.stereotype = ImmutableCapabilities.copyOf(Require.nonNull("Stereotype", stereotype));
@@ -117,6 +122,7 @@ public class OneShotNode extends Node {
     LoggingOptions loggingOptions = new LoggingOptions(config);
     EventBusOptions eventOptions = new EventBusOptions(config);
     BaseServerOptions serverOptions = new BaseServerOptions(config);
+    SecretOptions secretOptions = new SecretOptions(config);
     NodeOptions nodeOptions = new NodeOptions(config);
 
     Map<String, Object> raw = new Json().toType(
@@ -142,7 +148,8 @@ public class OneShotNode extends Node {
     return new OneShotNode(
       loggingOptions.getTracer(),
       eventOptions.getEventBus(),
-      serverOptions.getRegistrationSecret(),
+      secretOptions.getRegistrationSecret(),
+      nodeOptions.getHeartbeatPeriod(),
       new NodeId(UUID.randomUUID()),
       serverOptions.getExternalUri(),
       nodeOptions.getPublicGridUri().orElseThrow(() -> new ConfigException("Unable to determine public grid address")),
@@ -151,19 +158,19 @@ public class OneShotNode extends Node {
   }
 
   @Override
-  public Optional<CreateSessionResponse> newSession(CreateSessionRequest sessionRequest) {
+  public Either<WebDriverException, CreateSessionResponse> newSession(CreateSessionRequest sessionRequest) {
     if (driver != null) {
       throw new IllegalStateException("Only expected one session at a time");
     }
 
     Optional<WebDriver> driver = driverInfo.createDriver(sessionRequest.getCapabilities());
     if (!driver.isPresent()) {
-      return Optional.empty();
+      return Either.left(new WebDriverException("Unable to create a driver instance"));
     }
 
     if (!(driver.get() instanceof RemoteWebDriver)) {
       driver.get().quit();
-      return Optional.empty();
+      return Either.left(new WebDriverException("Driver is not a RemoteWebDriver instance"));
     }
 
     this.driver = (RemoteWebDriver) driver.get();
@@ -179,7 +186,7 @@ public class OneShotNode extends Node {
 
     events.fire(new NodeDrainStarted(getId()));
 
-    return Optional.of(
+    return Either.right(
       new CreateSessionResponse(
         getSession(sessionId),
         JSON.toJson(ImmutableMap.of(
@@ -222,16 +229,10 @@ public class OneShotNode extends Node {
   }
 
   private Capabilities rewriteCapabilities(RemoteWebDriver driver) {
-    // Rewrite the se:options if necessary
-    Object rawSeleniumOptions = driver.getCapabilities().getCapability("se:options");
-    if (rawSeleniumOptions == null || rawSeleniumOptions instanceof Map) {
-      @SuppressWarnings("unchecked") Map<String, Object> original = (Map<String, Object>) rawSeleniumOptions;
-      Map<String, Object> updated = new TreeMap<>(original == null ? new HashMap<>() : original);
-
+    // Rewrite the se:options if necessary to add cdp url
+    if (driverInfo.isSupportingCdp()) {
       String cdpPath = String.format("/session/%s/se/cdp", driver.getSessionId());
-      updated.put("cdp", rewrite(cdpPath));
-
-      return new PersistentCapabilities(driver.getCapabilities()).setCapability("se:options", updated);
+      return new PersistentCapabilities(driver.getCapabilities()).setCapability("se:cdp", rewrite(cdpPath));
     }
 
     return ImmutableCapabilities.copyOf(driver.getCapabilities());
@@ -273,7 +274,7 @@ public class OneShotNode extends Node {
           stop(sessionId);
         },
         "Node clean up: " + getId())
-      .start();
+        .start();
     }
 
     return res;
@@ -290,7 +291,8 @@ public class OneShotNode extends Node {
       getUri(),
       stereotype,
       capabilities,
-      sessionStart); }
+      sessionStart);
+  }
 
   @Override
   public HttpResponse uploadFile(HttpRequest req, SessionId id) {
@@ -342,7 +344,10 @@ public class OneShotNode extends Node {
           driver == null ?
             Optional.empty() :
             Optional.of(new Session(sessionId, getUri(), stereotype, capabilities, Instant.now())))),
-      isDraining() ? DRAINING : UP);
+      isDraining() ? DRAINING : UP,
+      heartbeatPeriod,
+      getNodeVersion(),
+      getOsInfo());
   }
 
   @Override

@@ -28,15 +28,14 @@ import org.openqa.selenium.internal.Require;
 
 public class V85Domains implements Domains {
 
-  private final V85Events events;
   private final V85Javascript js;
-  private final V85Target target;
-  private final V85Network network;
+  private final V85Events events;
   private final V85Log log;
+  private final V85Network network;
+  private final V85Target target;
 
   public V85Domains(DevTools devtools) {
     Require.nonNull("DevTools", devtools);
-
     events = new V85Events(devtools);
     js = new V85Javascript(devtools);
     log = new V85Log();
@@ -68,5 +67,4 @@ public class V85Domains implements Domains {
   public Log log() {
     return log;
   }
-
 }

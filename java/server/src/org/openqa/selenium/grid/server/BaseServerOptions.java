@@ -20,7 +20,9 @@ package org.openqa.selenium.grid.server;
 import org.openqa.selenium.WebDriverException;
 import org.openqa.selenium.grid.config.Config;
 import org.openqa.selenium.grid.config.ConfigException;
-import org.openqa.selenium.grid.security.Secret;
+import org.openqa.selenium.grid.jmx.JMXHelper;
+import org.openqa.selenium.grid.jmx.ManagedAttribute;
+import org.openqa.selenium.grid.jmx.ManagedService;
 import org.openqa.selenium.net.HostIdentifier;
 import org.openqa.selenium.net.NetworkUtils;
 import org.openqa.selenium.net.PortProber;
@@ -31,6 +33,8 @@ import java.net.URISyntaxException;
 import java.util.Optional;
 import java.util.logging.Logger;
 
+@ManagedService(objectName = "org.seleniumhq.grid:type=Config,name=BaseServerConfig",
+  description = "Server config")
 public class BaseServerOptions {
 
   private static final String SERVER_SECTION = "server";
@@ -41,16 +45,18 @@ public class BaseServerOptions {
 
   public BaseServerOptions(Config config) {
     this.config = config;
+    new JMXHelper().register(this);
   }
 
   public Optional<String> getHostname() {
-    return config.get(SERVER_SECTION, "hostname");
+    return config.get(SERVER_SECTION, "host");
   }
 
+  @ManagedAttribute(name = "Port")
   public int getPort() {
     if (port == -1) {
       int newPort = config.getInt(SERVER_SECTION, "port")
-          .orElseGet(PortProber::findFreePort);
+        .orElseGet(PortProber::findFreePort);
 
       if (newPort < 0) {
         throw new ConfigException("Port cannot be less than 0: " + newPort);
@@ -62,9 +68,10 @@ public class BaseServerOptions {
     return port;
   }
 
+  @ManagedAttribute(name = "MaxServerThreads")
   public int getMaxServerThreads() {
     int count = config.getInt(SERVER_SECTION, "max-threads")
-        .orElse(200);
+      .orElse(Runtime.getRuntime().availableProcessors() * 3);
 
     if (count < 0) {
       throw new ConfigException("Maximum number of server threads cannot be less than 0: " + count);
@@ -73,23 +80,31 @@ public class BaseServerOptions {
     return count;
   }
 
+  @ManagedAttribute(name = "Uri")
   public URI getExternalUri() {
     // Assume the host given is addressable if it's been set
     String host = getHostname()
-        .orElseGet(() -> {
-          try {
-            return new NetworkUtils().getNonLoopbackAddressOfThisMachine();
-          } catch (WebDriverException e) {
-            String name = HostIdentifier.getHostName();
-            LOG.info("No network connection, guessing name: " + name);
-            return name;
-          }
-        });
+      .orElseGet(() -> {
+        try {
+          return new NetworkUtils().getNonLoopbackAddressOfThisMachine();
+        } catch (WebDriverException e) {
+          String name = HostIdentifier.getHostName();
+          LOG.info("No network connection, guessing name: " + name);
+          return name;
+        }
+      });
 
     int port = getPort();
 
     try {
-      return new URI((isSecure() || isSelfSigned()) ? "https" : "http", null, host, port, null, null, null);
+      return new URI(
+        (isSecure() || isSelfSigned()) ? "https" : "http",
+        null,
+        host,
+        port,
+        null,
+        null,
+        null);
     } catch (URISyntaxException e) {
       throw new ConfigException("Cannot determine external URI: " + e.getMessage());
     }
@@ -100,7 +115,8 @@ public class BaseServerOptions {
   }
 
   public boolean isSecure() {
-    return config.get(SERVER_SECTION, "https-private-key").isPresent() && config.get(SERVER_SECTION, "https-certificate").isPresent();
+    return config.get(SERVER_SECTION, "https-private-key").isPresent()
+           && config.get(SERVER_SECTION, "https-certificate").isPresent();
   }
 
   public File getPrivateKey() {
@@ -108,19 +124,19 @@ public class BaseServerOptions {
     if (privateKey != null) {
       return new File(privateKey);
     }
-    throw new ConfigException("you must provide a private key via --https-private-key when using --https");
+    throw new ConfigException("Please provide a private key via --https-private-key " +
+                              "when using --https");
   }
 
   public File getCertificate() {
-    String certificatePath = config.get(SERVER_SECTION, "https-certificate").orElse(null);
+    String certificatePath = config
+      .get(SERVER_SECTION, "https-certificate")
+      .orElse(null);
     if (certificatePath != null) {
       return new File(certificatePath);
     }
-    throw new ConfigException("you must provide a certificate via --https-certificate when using --https");
-  }
-
-  public Secret getRegistrationSecret() {
-    return config.get(SERVER_SECTION, "registration-secret").map(Secret::new).orElse(new Secret(""));
+    throw new ConfigException("Please provide a certificate via --https-certificate " +
+                              "when using --https");
   }
 
   public boolean isSelfSigned() {

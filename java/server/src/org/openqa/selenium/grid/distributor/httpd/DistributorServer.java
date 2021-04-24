@@ -41,9 +41,11 @@ import java.util.logging.Logger;
 
 import static java.net.HttpURLConnection.HTTP_INTERNAL_ERROR;
 import static java.net.HttpURLConnection.HTTP_OK;
+import static org.openqa.selenium.grid.config.StandardGridRoles.DISTRIBUTOR_ROLE;
 import static org.openqa.selenium.grid.config.StandardGridRoles.EVENT_BUS_ROLE;
 import static org.openqa.selenium.grid.config.StandardGridRoles.HTTPD_ROLE;
 import static org.openqa.selenium.grid.config.StandardGridRoles.SESSION_MAP_ROLE;
+import static org.openqa.selenium.grid.config.StandardGridRoles.SESSION_QUEUE_ROLE;
 import static org.openqa.selenium.remote.http.HttpMethod.GET;
 import static org.openqa.selenium.remote.http.Route.get;
 
@@ -51,7 +53,6 @@ import static org.openqa.selenium.remote.http.Route.get;
 public class DistributorServer extends TemplateGridServerCommand {
 
   private static final Logger LOG = Logger.getLogger(DistributorServer.class.getName());
-  private static final String LOCAL_DISTRIBUTOR_SERVER = "org.openqa.selenium.grid.distributor.local.LocalDistributor";
 
   @Override
   public String getName() {
@@ -65,7 +66,7 @@ public class DistributorServer extends TemplateGridServerCommand {
 
   @Override
   public Set<Role> getConfigurableRoles() {
-    return ImmutableSet.of(EVENT_BUS_ROLE, HTTPD_ROLE, SESSION_MAP_ROLE);
+    return ImmutableSet.of(DISTRIBUTOR_ROLE, EVENT_BUS_ROLE, HTTPD_ROLE, SESSION_MAP_ROLE, SESSION_QUEUE_ROLE);
   }
 
   @Override
@@ -87,7 +88,7 @@ public class DistributorServer extends TemplateGridServerCommand {
   protected Handlers createHandlers(Config config) {
     DistributorOptions distributorOptions = new DistributorOptions(config);
 
-    Distributor distributor = distributorOptions.getDistributor(LOCAL_DISTRIBUTOR_SERVER);
+    Distributor distributor = distributorOptions.getDistributor();
 
     HttpHandler readinessCheck = req -> {
       boolean ready = distributor.isReady();

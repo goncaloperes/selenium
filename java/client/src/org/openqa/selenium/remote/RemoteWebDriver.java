@@ -17,31 +17,8 @@
 
 package org.openqa.selenium.remote;
 
-import static java.nio.charset.StandardCharsets.UTF_8;
-import static java.util.concurrent.TimeUnit.SECONDS;
-import static org.openqa.selenium.remote.CapabilityType.LOGGING_PREFS;
-import static org.openqa.selenium.remote.CapabilityType.PLATFORM;
-import static org.openqa.selenium.remote.CapabilityType.PLATFORM_NAME;
-import static org.openqa.selenium.remote.CapabilityType.SUPPORTS_JAVASCRIPT;
-
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
-import java.net.URL;
-import java.util.Base64;
-import java.time.Duration;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.Date;
-import java.util.HashSet;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.TimeUnit;
-import java.util.logging.Level;
-import java.util.logging.Logger;
-import java.util.stream.Collectors;
-import java.util.stream.Stream;
 import org.openqa.selenium.Alert;
 import org.openqa.selenium.Beta;
 import org.openqa.selenium.By;
@@ -50,15 +27,19 @@ import org.openqa.selenium.Cookie;
 import org.openqa.selenium.Dimension;
 import org.openqa.selenium.HasCapabilities;
 import org.openqa.selenium.ImmutableCapabilities;
+import org.openqa.selenium.InvalidArgumentException;
 import org.openqa.selenium.JavascriptExecutor;
 import org.openqa.selenium.MutableCapabilities;
 import org.openqa.selenium.NoSuchElementException;
 import org.openqa.selenium.NoSuchFrameException;
 import org.openqa.selenium.NoSuchWindowException;
 import org.openqa.selenium.OutputType;
+import org.openqa.selenium.Pdf;
 import org.openqa.selenium.Platform;
 import org.openqa.selenium.Point;
+import org.openqa.selenium.PrintsPage;
 import org.openqa.selenium.SearchContext;
+import org.openqa.selenium.SessionNotCreatedException;
 import org.openqa.selenium.TakesScreenshot;
 import org.openqa.selenium.WebDriver;
 import org.openqa.selenium.WebDriverException;
@@ -76,20 +57,63 @@ import org.openqa.selenium.logging.LoggingHandler;
 import org.openqa.selenium.logging.LoggingPreferences;
 import org.openqa.selenium.logging.Logs;
 import org.openqa.selenium.logging.NeedsLocalLogs;
+import org.openqa.selenium.print.PrintOptions;
+import org.openqa.selenium.remote.http.ClientConfig;
+import org.openqa.selenium.remote.http.HttpClient;
 import org.openqa.selenium.remote.internal.WebElementToJsonConverter;
+import org.openqa.selenium.remote.tracing.TracedHttpClient;
+import org.openqa.selenium.remote.tracing.Tracer;
+import org.openqa.selenium.remote.tracing.opentelemetry.OpenTelemetryTracer;
 import org.openqa.selenium.virtualauthenticator.Credential;
 import org.openqa.selenium.virtualauthenticator.HasVirtualAuthenticator;
 import org.openqa.selenium.virtualauthenticator.VirtualAuthenticator;
 import org.openqa.selenium.virtualauthenticator.VirtualAuthenticatorOptions;
 
-@Augmentable
-public class RemoteWebDriver implements WebDriver, JavascriptExecutor,
-      HasInputDevices, HasCapabilities, Interactive, TakesScreenshot,
-      HasVirtualAuthenticator {
+import java.net.MalformedURLException;
+import java.net.URL;
+import java.time.Duration;
+import java.util.Base64;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
-  // TODO(dawagner): This static logger should be unified with the per-instance localLogs
+import static java.util.concurrent.TimeUnit.SECONDS;
+import static org.openqa.selenium.remote.CapabilityType.LOGGING_PREFS;
+import static org.openqa.selenium.remote.CapabilityType.PLATFORM;
+import static org.openqa.selenium.remote.CapabilityType.PLATFORM_NAME;
+import static org.openqa.selenium.remote.CapabilityType.SUPPORTS_JAVASCRIPT;
+
+@Augmentable
+public class RemoteWebDriver implements WebDriver, JavascriptExecutor, HasInputDevices,
+                                        HasCapabilities, Interactive, TakesScreenshot,
+                                        HasVirtualAuthenticator, PrintsPage {
+
+  // TODO: This static logger should be unified with the per-instance localLogs
   private static final Logger logger = Logger.getLogger(RemoteWebDriver.class.getName());
   private Level level = Level.FINE;
+
+  private Map<Class<? extends By>, Mechanism> remotableBys = new HashMap<>();
+  // We would do this in either `init` or a constructor, but there are
+  // multiple constructors and we occasionally add a new one, and `init`
+  // may be overridden by the user
+  {
+    remotableBys.put(By.cssSelector("a").getClass(), Mechanism.REMOTE);
+    remotableBys.put(By.linkText("a").getClass(), Mechanism.REMOTE);
+    remotableBys.put(By.partialLinkText("a").getClass(), Mechanism.REMOTE);
+    remotableBys.put(By.tagName("a").getClass(), Mechanism.REMOTE);
+    remotableBys.put(By.xpath("//a").getClass(), Mechanism.REMOTE);
+  }
 
   private ErrorHandler errorHandler = new ErrorHandler();
   private CommandExecutor executor;
@@ -107,20 +131,42 @@ public class RemoteWebDriver implements WebDriver, JavascriptExecutor,
 
   // For cglib
   protected RemoteWebDriver() {
-    init(new ImmutableCapabilities());
+    this.capabilities = init(new ImmutableCapabilities());
+  }
+
+  private static URL getDefaultServerURL() {
+    try {
+      return new URL(System.getProperty("webdriver.remote.server", "http://localhost:4444/"));
+    } catch (MalformedURLException e) {
+      throw new WebDriverException(e);
+    }
   }
 
   public RemoteWebDriver(Capabilities capabilities) {
-    this((URL) null, capabilities);
+    this(getDefaultServerURL(),
+         Require.nonNull("Capabilities", capabilities));
+  }
+
+  public RemoteWebDriver(URL remoteAddress, Capabilities capabilities) {
+    this(createTracedExecutorWithTracedHttpClient(Require.nonNull("Server URL", remoteAddress)),
+         Require.nonNull("Capabilities", capabilities));
+  }
+
+  private static CommandExecutor createTracedExecutorWithTracedHttpClient(URL remoteAddress) {
+    Tracer tracer = OpenTelemetryTracer.getInstance();
+    CommandExecutor executor = new HttpCommandExecutor(
+      Collections.emptyMap(),
+      ClientConfig.defaultConfig().baseUrl(remoteAddress),
+      new TracedHttpClient.Factory(tracer, HttpClient.Factory.createDefault()));
+    return new TracedCommandExecutor(executor, tracer);
   }
 
   public RemoteWebDriver(CommandExecutor executor, Capabilities capabilities) {
-    this.executor = executor;
-
-    init(capabilities);
+    this.executor = Require.nonNull("Command executor", executor);
+    capabilities = init(capabilities);
 
     if (executor instanceof NeedsLocalLogs) {
-      ((NeedsLocalLogs)executor).setLocalLogs(localLogs);
+      ((NeedsLocalLogs) executor).setLocalLogs(localLogs);
     }
 
     try {
@@ -136,16 +182,12 @@ public class RemoteWebDriver implements WebDriver, JavascriptExecutor,
     }
   }
 
-  public RemoteWebDriver(URL remoteAddress, Capabilities capabilities) {
-    this(new HttpCommandExecutor(remoteAddress), capabilities);
-  }
-
   @Beta
   public static RemoteWebDriverBuilder builder() {
     return new RemoteWebDriverBuilder();
   }
 
-  private void init(Capabilities capabilities) {
+  private Capabilities init(Capabilities capabilities) {
     capabilities = capabilities == null ? new ImmutableCapabilities() : capabilities;
 
     logger.addHandler(LoggingHandler.getInstance());
@@ -173,10 +215,12 @@ public class RemoteWebDriver implements WebDriver, JavascriptExecutor,
     Set<String> logTypesToInclude = builder.build();
 
     LocalLogs performanceLogger = LocalLogs.getStoringLoggerInstance(logTypesToInclude);
-    LocalLogs clientLogs = LocalLogs.getHandlerBasedLoggerInstance(LoggingHandler.getInstance(),
-        logTypesToInclude);
+    LocalLogs clientLogs = LocalLogs.getHandlerBasedLoggerInstance(
+      LoggingHandler.getInstance(), logTypesToInclude);
     localLogs = LocalLogs.getCombinedLogsHolder(clientLogs, performanceLogger);
     remoteLogs = new RemoteLogs(executeMethod, localLogs);
+
+    return capabilities;
   }
 
   /**
@@ -206,17 +250,30 @@ public class RemoteWebDriver implements WebDriver, JavascriptExecutor,
   protected void startSession(Capabilities capabilities) {
     Response response = execute(DriverCommand.NEW_SESSION(capabilities));
 
-    Map<String, Object> rawCapabilities = (Map<String, Object>) response.getValue();
-    MutableCapabilities returnedCapabilities = new MutableCapabilities();
-    for (Map.Entry<String, Object> entry : rawCapabilities.entrySet()) {
-      // Handle the platform later
-      if (PLATFORM.equals(entry.getKey()) || PLATFORM_NAME.equals(entry.getKey())) {
-        continue;
-      }
-      returnedCapabilities.setCapability(entry.getKey(), entry.getValue());
+    if (response == null) {
+      throw new SessionNotCreatedException(
+        "The underlying command executor returned a null response.");
     }
-    String platformString = (String) rawCapabilities.getOrDefault(PLATFORM,
-                                                                  rawCapabilities.get(PLATFORM_NAME));
+
+    Object responseValue = response.getValue();
+
+    if (responseValue == null) {
+      throw new SessionNotCreatedException(
+        "The underlying command executor returned a response without payload: " +
+        response.toString());
+    }
+
+    if (!(responseValue instanceof Map)) {
+      throw new SessionNotCreatedException(
+        "The underlying command executor returned a response with a non well formed payload: " +
+        response.toString());
+    }
+
+    Map<String, Object> rawCapabilities = (Map<String, Object>) responseValue;
+    MutableCapabilities returnedCapabilities = new MutableCapabilities(rawCapabilities);
+    String platformString = (String) rawCapabilities.getOrDefault(
+      PLATFORM,
+      rawCapabilities.get(PLATFORM_NAME));
     Platform platform;
     try {
       if (platformString == null || "".equals(platformString)) {
@@ -265,6 +322,9 @@ public class RemoteWebDriver implements WebDriver, JavascriptExecutor,
 
   @Override
   public Capabilities getCapabilities() {
+    if(capabilities == null){
+      return new ImmutableCapabilities();
+    }
     return capabilities;
   }
 
@@ -297,8 +357,7 @@ public class RemoteWebDriver implements WebDriver, JavascriptExecutor,
       String base64EncodedPng = (String) result;
       return outputType.convertFromBase64Png(base64EncodedPng);
     } else if (result instanceof byte[]) {
-      String base64EncodedPng = new String((byte[]) result, UTF_8);
-      return outputType.convertFromBase64Png(base64EncodedPng);
+      return outputType.convertFromPngBytes((byte[]) result);
     } else {
       throw new RuntimeException(String.format("Unexpected result for %s command: %s",
           DriverCommand.SCREENSHOT,
@@ -307,41 +366,122 @@ public class RemoteWebDriver implements WebDriver, JavascriptExecutor,
   }
 
   @Override
+  public Pdf print(PrintOptions printOptions) throws WebDriverException {
+    Response response = execute(DriverCommand.PRINT_PAGE(printOptions));
+
+    Object result = response.getValue();
+    return new Pdf((String) result);
+  }
+
+  @Override
   public WebElement findElement(By locator) {
-    if (locator instanceof By.StandardLocator) {
-      return ((By.StandardLocator) locator).findElement(this, this::findElement);
-    } else {
-      return locator.findElement(this);
+    Require.nonNull("Locator", locator);
+
+    return findElement(this, this, locator);
+  }
+
+  WebElement findElement(RemoteWebDriver parent, SearchContext context, By locator) {
+    Mechanism mechanism = remotableBys.get(locator.getClass());
+    if (mechanism != null) {
+      WebElement element = mechanism.findElement(parent, context, locator);
+      return massage(parent, context, element, locator);
+    }
+
+    // Attempt to find the element remotely
+    if (locator instanceof By.Remotable) {
+      try {
+        WebElement element = Mechanism.REMOTE.findElement(parent, context, locator);
+        remotableBys.put(locator.getClass(), Mechanism.REMOTE);
+        return massage(parent, context, element, locator);
+      } catch (NoSuchElementException e) {
+        remotableBys.put(locator.getClass(), Mechanism.REMOTE);
+        throw e;
+      } catch (InvalidArgumentException e) {
+        // Fall through
+      }
+    }
+
+    try {
+      WebElement element = Mechanism.CONTEXT.findElement(parent, context, locator);
+      remotableBys.put(locator.getClass(), Mechanism.CONTEXT);
+      return massage(parent, context, element, locator);
+    } catch (NoSuchElementException e) {
+      remotableBys.put(locator.getClass(), Mechanism.CONTEXT);
+      throw e;
     }
   }
 
   @Override
   public List<WebElement> findElements(By locator) {
-    if (locator instanceof By.StandardLocator) {
-      return ((By.StandardLocator) locator).findElements(this, this::findElements);
-    } else {
-      return locator.findElements(this);
+    Require.nonNull("Locator", locator);
+
+    return findElements(this, this, locator);
+  }
+
+  public List<WebElement> findElements(RemoteWebDriver parent, SearchContext context, By locator) {
+    Mechanism mechanism = remotableBys.get(locator.getClass());
+    if (mechanism != null) {
+      List<WebElement> elements = mechanism.findElements(parent, context, locator);
+      elements.forEach(e -> massage(parent, context, e, locator));
+      return elements;
+    }
+
+    // Attempt to find the element remotely
+    if (locator instanceof By.Remotable) {
+      try {
+        List<WebElement> elements = Mechanism.REMOTE.findElements(parent, context, locator);
+        remotableBys.put(locator.getClass(), Mechanism.REMOTE);
+        elements.forEach(e -> massage(parent, context, e, locator));
+        return elements;
+      } catch (NoSuchElementException e) {
+        remotableBys.put(locator.getClass(), Mechanism.REMOTE);
+        throw e;
+      } catch (InvalidArgumentException e) {
+        // Fall through
+      }
+    }
+
+    try {
+      List<WebElement> elements = Mechanism.CONTEXT.findElements(parent, context, locator);
+      remotableBys.put(locator.getClass(), Mechanism.CONTEXT);
+      elements.forEach(e -> massage(parent, context, e, locator));
+      return elements;
+    } catch (NoSuchElementException e) {
+      remotableBys.put(locator.getClass(), Mechanism.CONTEXT);
+      throw e;
     }
   }
 
-  protected WebElement findElement(String by, String using) {
-    if (using == null) {
-      throw new IllegalArgumentException("Cannot find elements when the selector is null.");
+  private WebElement massage(RemoteWebDriver parent, SearchContext context, WebElement element, By locator) {
+    if (!(element instanceof RemoteWebElement)) {
+      return element;
     }
 
-    Response response = execute(DriverCommand.FIND_ELEMENT(by, using));
-    Object value = response.getValue();
-    if (value == null) { // see https://github.com/SeleniumHQ/selenium/issues/5809
-      throw new NoSuchElementException(String.format("Cannot locate an element using %s=%s", by, using));
+    RemoteWebElement remoteElement = (RemoteWebElement) element;
+    if (locator instanceof By.Remotable) {
+      By.Remotable.Parameters params = ((By.Remotable) locator).getRemoteParameters();
+      remoteElement.setFoundBy(context, params.using(), String.valueOf(params.value()));
     }
-    WebElement element;
-    try {
-      element = (WebElement) value;
-    } catch (ClassCastException ex) {
-      throw new WebDriverException("Returned value cannot be converted to WebElement: " + value, ex);
-    }
-    setFoundBy(this, element, by, using);
-    return element;
+    remoteElement.setFileDetector(parent.getFileDetector());
+    remoteElement.setParent(parent);
+
+    return remoteElement;
+  }
+
+  /**
+   * @deprecated Rely on using {@link By.Remotable} instead
+   */
+  @Deprecated
+  protected WebElement findElement(String by, String using) {
+    throw new UnsupportedOperationException("`findElement` has been replaced by usages of " + By.Remotable.class);
+  }
+
+  /**
+   * @deprecated Rely on using {@link By.Remotable} instead
+   */
+  @Deprecated
+  protected List<WebElement> findElements(String by, String using) {
+    throw new UnsupportedOperationException("`findElement` has been replaced by usages of " + By.Remotable.class);
   }
 
   protected void setFoundBy(SearchContext context, WebElement element, String by, String using) {
@@ -350,29 +490,6 @@ public class RemoteWebDriver implements WebDriver, JavascriptExecutor,
       remoteElement.setFoundBy(context, by, using);
       remoteElement.setFileDetector(getFileDetector());
     }
-  }
-
-  @SuppressWarnings("unchecked")
-  protected List<WebElement> findElements(String by, String using) {
-    if (using == null) {
-      throw new IllegalArgumentException("Cannot find elements when the selector is null.");
-    }
-
-    Response response = execute(DriverCommand.FIND_ELEMENTS(by, using));
-    Object value = response.getValue();
-    if (value == null) { // see https://github.com/SeleniumHQ/selenium/issues/4555
-      return Collections.emptyList();
-    }
-    List<WebElement> allElements;
-    try {
-      allElements = (List<WebElement>) value;
-    } catch (ClassCastException ex) {
-      throw new WebDriverException("Returned value cannot be converted to List<WebElement>: " + value, ex);
-    }
-    for (WebElement element : allElements) {
-      setFoundBy(this, element, by, using);
-    }
-    return allElements;
   }
 
   // Misc
@@ -453,7 +570,7 @@ public class RemoteWebDriver implements WebDriver, JavascriptExecutor,
   }
 
   private boolean isJavascriptEnabled() {
-    return capabilities.is(SUPPORTS_JAVASCRIPT);
+    return getCapabilities().is(SUPPORTS_JAVASCRIPT);
   }
 
   @Override
@@ -486,6 +603,7 @@ public class RemoteWebDriver implements WebDriver, JavascriptExecutor,
    */
   public void setLogLevel(Level level) {
     this.level = level;
+    logger.setLevel(level);
   }
 
   protected Response execute(CommandPayload payload) {
@@ -495,7 +613,7 @@ public class RemoteWebDriver implements WebDriver, JavascriptExecutor,
     long start = System.currentTimeMillis();
     String currentName = Thread.currentThread().getName();
     Thread.currentThread().setName(
-        String.format("Forwarding %s on session %s to remote", command.getName(), sessionId));
+      String.format("Forwarding %s on session %s to remote", command.getName(), sessionId));
     try {
       log(sessionId, command.getName(), command, When.BEFORE);
       response = executor.execute(command);
@@ -509,24 +627,25 @@ public class RemoteWebDriver implements WebDriver, JavascriptExecutor,
       // {"ELEMENT": id} to RemoteWebElements.
       Object value = getElementConverter().apply(response.getValue());
       response.setValue(value);
-    } catch (WebDriverException e) {
-      throw e;
-    } catch (Exception e) {
+    } catch (Throwable e) {
       log(sessionId, command.getName(), command, When.EXCEPTION);
-      String errorMessage = "Error communicating with the remote browser. " +
-          "It may have died.";
+      WebDriverException toThrow;
       if (command.getName().equals(DriverCommand.NEW_SESSION)) {
-        errorMessage = "Could not start a new session. Possible causes are " +
-            "invalid address of the remote server or browser start-up failure.";
+        if (e instanceof SessionNotCreatedException) {
+          toThrow = (WebDriverException) e;
+        } else {
+          toThrow = new SessionNotCreatedException(
+            "Possible causes are invalid address of the remote server or browser start-up failure.", e);
+        }
+      } else if (e instanceof WebDriverException) {
+        toThrow = (WebDriverException) e;
+      } else {
+        toThrow = new UnreachableBrowserException(
+          "Error communicating with the remote browser. It may have died.", e);
       }
-      UnreachableBrowserException ube = new UnreachableBrowserException(errorMessage, e);
-      if (getSessionId() != null) {
-        ube.addInfo(WebDriverException.SESSION_ID, getSessionId().toString());
-      }
-      if (getCapabilities() != null) {
-        ube.addInfo("Capabilities", getCapabilities().toString());
-      }
-      throw ube;
+      populateWebDriverException(toThrow);
+      toThrow.addInfo("Command", command.toString());
+      throw toThrow;
     } finally {
       Thread.currentThread().setName(currentName);
     }
@@ -534,24 +653,21 @@ public class RemoteWebDriver implements WebDriver, JavascriptExecutor,
     try {
       errorHandler.throwIfResponseFailed(response, System.currentTimeMillis() - start);
     } catch (WebDriverException ex) {
-      if (command.getParameters() != null && command.getParameters().containsKey("using") && command.getParameters().containsKey("value")) {
-        ex.addInfo(
-            "*** Element info",
-            String.format(
-                "{Using=%s, value=%s}",
-                command.getParameters().get("using"),
-                command.getParameters().get("value")));
-      }
-      ex.addInfo(WebDriverException.DRIVER_INFO, this.getClass().getName());
-      if (getSessionId() != null) {
-        ex.addInfo(WebDriverException.SESSION_ID, getSessionId().toString());
-      }
-      if (getCapabilities() != null) {
-        ex.addInfo("Capabilities", getCapabilities().toString());
-      }
+      populateWebDriverException(ex);
+      ex.addInfo("Command", command.toString());
       throw ex;
     }
     return response;
+  }
+
+  private void populateWebDriverException(WebDriverException ex) {
+    ex.addInfo(WebDriverException.DRIVER_INFO, this.getClass().getName());
+    if (getSessionId() != null) {
+      ex.addInfo(WebDriverException.SESSION_ID, getSessionId().toString());
+    }
+    if (getCapabilities() != null) {
+      ex.addInfo("Capabilities", getCapabilities().toString());
+    }
   }
 
   protected Response execute(String driverCommand, Map<String, ?> parameters) {
@@ -774,6 +890,14 @@ public class RemoteWebDriver implements WebDriver, JavascriptExecutor,
         return this;
       }
 
+      @Override
+      public Duration getImplicitWaitTimeout() {
+        Response response = execute(DriverCommand.GET_TIMEOUTS);
+        Map<String, Object> rawSize = (Map<String, Object>) response.getValue();
+        long timeout = ((Number) rawSize.get("implicit")).longValue();
+        return Duration.ofMillis(timeout);
+      }
+
       @Deprecated
       @Override
       public Timeouts setScriptTimeout(long time, TimeUnit unit) {
@@ -786,6 +910,14 @@ public class RemoteWebDriver implements WebDriver, JavascriptExecutor,
         return this;
       }
 
+      @Override
+      public Duration getScriptTimeout() {
+        Response response = execute(DriverCommand.GET_TIMEOUTS);
+        Map<String, Object> rawSize = (Map<String, Object>) response.getValue();
+        long timeout = ((Number) rawSize.get("script")).longValue();
+        return Duration.ofMillis(timeout);
+      }
+
       @Deprecated
       @Override
       public Timeouts pageLoadTimeout(long time, TimeUnit unit) {
@@ -796,6 +928,14 @@ public class RemoteWebDriver implements WebDriver, JavascriptExecutor,
       public Timeouts pageLoadTimeout(Duration duration) {
         execute(DriverCommand.SET_PAGE_LOAD_TIMEOUT(duration));
         return this;
+      }
+
+      @Override
+      public Duration getPageLoadTimeout() {
+        Response response = execute(DriverCommand.GET_TIMEOUTS);
+        Map<String, Object> rawSize = (Map<String, Object>) response.getValue();
+        long timeout = ((Number) rawSize.get("pageLoad")).longValue();
+        return Duration.ofMillis(timeout);
       }
     } // timeouts class.
 
@@ -1084,5 +1224,83 @@ public class RemoteWebDriver implements WebDriver, JavascriptExecutor,
         caps.getBrowserName(),
         platform,
         getSessionId());
+  }
+
+  private enum Mechanism {
+    CONTEXT {
+      @Override
+      WebElement findElement(RemoteWebDriver parent, SearchContext context, By locator) {
+        return locator.findElement(context);
+      }
+
+      @Override
+      List<WebElement> findElements(RemoteWebDriver parent, SearchContext context, By locator) {
+        return locator.findElements(context);
+      }
+    },
+    REMOTE {
+      @Override
+      WebElement findElement(RemoteWebDriver parent, SearchContext context, By locator) {
+        String commandName;
+        Map<String, Object> params = new HashMap<>();
+
+        By.Remotable.Parameters fromLocator = ((By.Remotable) locator).getRemoteParameters();
+        params.put("using", fromLocator.using());
+        params.put("value", fromLocator.value());
+
+        if (context instanceof RemoteWebElement) {
+          commandName = DriverCommand.FIND_CHILD_ELEMENT;
+          params.put("id", ((RemoteWebElement) context).getId());
+        } else {
+          commandName = DriverCommand.FIND_ELEMENT;
+        }
+
+        Response response = parent.execute(new CommandPayload(commandName, params));
+        Object value = response.getValue();
+        if (value == null) {
+          throw new NoSuchElementException("Unable to find element with locator " + locator);
+        }
+        try {
+          return (WebElement) value;
+        } catch (ClassCastException ex) {
+          throw new WebDriverException(
+            "Returned value cannot be converted to WebElement: " + value, ex);
+        }
+      }
+
+      @Override
+      List<WebElement> findElements(RemoteWebDriver parent, SearchContext context, By locator) {
+        String commandName;
+        Map<String, Object> params = new HashMap<>();
+
+        By.Remotable.Parameters fromLocator = ((By.Remotable) locator).getRemoteParameters();
+        params.put("using", fromLocator.using());
+        params.put("value", fromLocator.value());
+
+        if (context instanceof RemoteWebElement) {
+          commandName = DriverCommand.FIND_CHILD_ELEMENTS;
+          params.put("id", ((RemoteWebElement) context).getId());
+        } else {
+          commandName = DriverCommand.FIND_ELEMENTS;
+        }
+
+        Response response = parent.execute(new CommandPayload(commandName, params));
+        Object value = response.getValue();
+        if (value == null) { // see https://github.com/SeleniumHQ/selenium/issues/4555
+          return Collections.emptyList();
+        }
+        try {
+          @SuppressWarnings("unchecked") List<WebElement> toReturn = (List<WebElement>) value;
+          return toReturn;
+        } catch (ClassCastException ex) {
+          throw new WebDriverException(
+            "Returned value cannot be converted to WebElement: " + value, ex);
+        }
+      }
+    }
+    ;
+
+    abstract WebElement findElement(RemoteWebDriver parent, SearchContext context, By locator);
+    abstract List<WebElement> findElements(RemoteWebDriver parent, SearchContext context, By locator);
   }
 }

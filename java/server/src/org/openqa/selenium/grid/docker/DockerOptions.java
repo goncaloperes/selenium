@@ -18,11 +18,13 @@
 package org.openqa.selenium.grid.docker;
 
 import com.google.common.collect.HashMultimap;
-import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableMultimap;
 import com.google.common.collect.Multimap;
+
 import org.openqa.selenium.Capabilities;
 import org.openqa.selenium.Platform;
+import org.openqa.selenium.docker.ContainerId;
+import org.openqa.selenium.docker.ContainerInfo;
 import org.openqa.selenium.docker.Docker;
 import org.openqa.selenium.docker.DockerException;
 import org.openqa.selenium.docker.Image;
@@ -31,6 +33,7 @@ import org.openqa.selenium.grid.config.ConfigException;
 import org.openqa.selenium.grid.node.SessionFactory;
 import org.openqa.selenium.internal.Require;
 import org.openqa.selenium.json.Json;
+import org.openqa.selenium.net.HostIdentifier;
 import org.openqa.selenium.remote.http.ClientConfig;
 import org.openqa.selenium.remote.http.HttpClient;
 import org.openqa.selenium.remote.tracing.Tracer;
@@ -50,8 +53,11 @@ import static org.openqa.selenium.Platform.WINDOWS;
 
 public class DockerOptions {
 
-  private static final String DOCKER_SECTION = "docker";
-
+  static final String DOCKER_SECTION = "docker";
+  static final String DEFAULT_ASSETS_PATH = "/opt/selenium/assets";
+  static final String DEFAULT_DOCKER_URL = "unix:/var/run/docker.sock";
+  static final String DEFAULT_VIDEO_IMAGE = "selenium/video:latest";
+  private static final String DEFAULT_DOCKER_NETWORK = "bridge";
   private static final Logger LOG = Logger.getLogger(DockerOptions.class.getName());
   private static final Json JSON = new Json();
   private final Config config;
@@ -68,10 +74,14 @@ public class DockerOptions {
       }
 
       Optional<String> possibleHost = config.get(DOCKER_SECTION, "host");
-      if (possibleHost.isPresent()) {
+      Optional<Integer> possiblePort = config.getInt(DOCKER_SECTION, "port");
+      if (possibleHost.isPresent() && possiblePort.isPresent()) {
         String host = possibleHost.get();
+        int port = possiblePort.get();
         if (!(host.startsWith("tcp:") || host.startsWith("http:") || host.startsWith("https"))) {
-          host = "http://" + host;
+          host = String.format("http://%s:%s", host, port);
+        } else {
+          host = String.format("%s:%s", host, port);
         }
         URI uri = new URI(host);
         return new URI(
@@ -88,30 +98,30 @@ public class DockerOptions {
       if (Platform.getCurrent().is(WINDOWS)) {
         return new URI("http://localhost:2376");
       }
-      return new URI("unix:/var/run/docker.sock");
+      return new URI(DEFAULT_DOCKER_URL);
     } catch (URISyntaxException e) {
       throw new ConfigException("Unable to determine docker url", e);
     }
   }
 
-  private boolean isEnabled(HttpClient.Factory clientFactory) {
+  private boolean isEnabled(Docker docker) {
     if (!config.getAll(DOCKER_SECTION, "configs").isPresent()) {
       return false;
     }
 
     // Is the daemon up and running?
-    URI uri = getDockerUri();
-    HttpClient client = clientFactory.createClient(ClientConfig.defaultConfig().baseUri(uri));
-
-    return new Docker(client).isSupported();
+    return docker.isSupported();
   }
 
   public Map<Capabilities, Collection<SessionFactory>> getDockerSessionFactories(
     Tracer tracer,
     HttpClient.Factory clientFactory) {
 
-    if (!isEnabled(clientFactory)) {
-      return ImmutableMap.of();
+    HttpClient client = clientFactory.createClient(ClientConfig.defaultConfig().baseUri(getDockerUri()));
+    Docker docker = new Docker(client);
+
+    if (!isEnabled(docker)) {
+      throw new DockerException("Unable to reach the Docker daemon at " + getDockerUri());
     }
 
     List<String> allConfigs = config.getAll(DOCKER_SECTION, "configs")
@@ -129,31 +139,88 @@ public class DockerOptions {
       kinds.put(imageName, stereotype);
     }
 
-    HttpClient client = clientFactory.createClient(ClientConfig.defaultConfig().baseUri(getDockerUri()));
-    Docker docker = new Docker(client);
+    // If Selenium Server is running inside a Docker container, we can inspect that container
+    // to get the information from it.
+    // Since Docker 1.12, the env var HOSTNAME has the container id (unless the user overwrites it)
+    String hostname = HostIdentifier.getHostName();
+    Optional<ContainerInfo> info = docker.inspect(new ContainerId(hostname));
+
+    DockerAssetsPath assetsPath = getAssetsPath(info);
+    String networkName = getDockerNetworkName(info);
 
     loadImages(docker, kinds.keySet().toArray(new String[0]));
+    Image videoImage = getVideoImage(docker);
+    loadImages(docker, videoImage.getName());
 
     int maxContainerCount = Runtime.getRuntime().availableProcessors();
     ImmutableMultimap.Builder<Capabilities, SessionFactory> factories = ImmutableMultimap.builder();
     kinds.forEach((name, caps) -> {
       Image image = docker.getImage(name);
       for (int i = 0; i < maxContainerCount; i++) {
-        factories.put(caps, new DockerSessionFactory(tracer, clientFactory, docker, getDockerUri(), image, caps));
+        factories.put(
+          caps,
+          new DockerSessionFactory(
+            tracer,
+            clientFactory,
+            docker,
+            getDockerUri(),
+            image,
+            caps,
+            videoImage,
+            assetsPath,
+            networkName,
+            info.isPresent()));
       }
       LOG.info(String.format(
-          "Mapping %s to docker image %s %d times",
-          caps,
-          name,
-          maxContainerCount));
+        "Mapping %s to docker image %s %d times",
+        caps,
+        name,
+        maxContainerCount));
     });
     return factories.build().asMap();
   }
 
+  private Image getVideoImage(Docker docker) {
+    String videoImage = config.get(DOCKER_SECTION, "video-image").orElse(DEFAULT_VIDEO_IMAGE);
+    return docker.getImage(videoImage);
+  }
+
+  @SuppressWarnings("OptionalUsedAsFieldOrParameterType")
+  private String getDockerNetworkName(Optional<ContainerInfo> info) {
+    if (info.isPresent()) {
+      return info.get().getNetworkName();
+    }
+    return DEFAULT_DOCKER_NETWORK;
+  }
+
+  @SuppressWarnings("OptionalUsedAsFieldOrParameterType")
+  private DockerAssetsPath getAssetsPath(Optional<ContainerInfo> info) {
+    if (info.isPresent()) {
+      Optional<Map<String, Object>> mountedVolume = info.get().getMountedVolumes()
+        .stream()
+        .filter(
+          mounted ->
+            DEFAULT_ASSETS_PATH.equalsIgnoreCase(String.valueOf(mounted.get("Destination"))))
+        .findFirst();
+
+      if (mountedVolume.isPresent()) {
+        String hostPath = String.valueOf(mountedVolume.get().get("Source"));
+        return new DockerAssetsPath(hostPath, DEFAULT_ASSETS_PATH);
+      }
+    }
+
+    Optional<String> assetsPath = config.get(DOCKER_SECTION, "assets-path");
+    // We assume the user is not running the Selenium Server inside a Docker container
+    // Therefore, we have access to the assets path on the host
+    return assetsPath.map(path -> new DockerAssetsPath(path, path)).orElse(null);
+
+  }
+
   private void loadImages(Docker docker, String... imageNames) {
     CompletableFuture<Void> cd = CompletableFuture.allOf(
-        Arrays.stream(imageNames)
-            .map(name -> CompletableFuture.supplyAsync(() -> docker.getImage(name))).toArray(CompletableFuture[]::new));
+      Arrays.stream(imageNames)
+            .map(name -> CompletableFuture.supplyAsync(() -> docker.getImage(name)))
+          .toArray(CompletableFuture[]::new));
 
     try {
       cd.get();

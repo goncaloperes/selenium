@@ -30,6 +30,7 @@ import org.openqa.selenium.grid.security.AddSecretFilter;
 import org.openqa.selenium.grid.security.Secret;
 import org.openqa.selenium.grid.sessionmap.NullSessionMap;
 import org.openqa.selenium.grid.web.Values;
+import org.openqa.selenium.internal.Either;
 import org.openqa.selenium.internal.Require;
 import org.openqa.selenium.remote.http.Filter;
 import org.openqa.selenium.remote.http.HttpClient;
@@ -41,7 +42,6 @@ import org.openqa.selenium.remote.tracing.Tracer;
 
 import java.net.URL;
 import java.util.Set;
-import java.util.function.Supplier;
 import java.util.logging.Logger;
 
 import static org.openqa.selenium.remote.http.Contents.asJson;
@@ -59,7 +59,7 @@ public class RemoteDistributor extends Distributor {
     super(
       tracer,
       factory,
-      (caps, nodes) -> {throw new UnsupportedOperationException("host selection");},
+      (caps, nodes) -> {throw new UnsupportedOperationException("Slot selector");},
       new NullSessionMap(tracer),
       registrationSecret);
     this.client = factory.createClient(url);
@@ -74,18 +74,6 @@ public class RemoteDistributor extends Distributor {
     } catch (Exception e) {
       return false;
     }
-  }
-
-  @Override
-  public CreateSessionResponse newSession(HttpRequest request)
-      throws SessionNotCreatedException {
-    HttpRequest upstream = new HttpRequest(POST, "/se/grid/distributor/session");
-    HttpTracing.inject(tracer, tracer.getCurrentContext(), upstream);
-    upstream.setContent(request.getContent());
-
-    HttpResponse response = client.with(addSecret).execute(upstream);
-
-    return Values.get(response, CreateSessionResponse.class);
   }
 
   @Override
@@ -142,7 +130,7 @@ public class RemoteDistributor extends Distributor {
   }
 
   @Override
-  protected Supplier<CreateSessionResponse> reserve(SlotId slot, CreateSessionRequest request) {
+  protected Either<SessionNotCreatedException, CreateSessionResponse> reserve(SlotId slot, CreateSessionRequest request) {
     throw new UnsupportedOperationException("reserve is not required for remote sessions");
   }
 }

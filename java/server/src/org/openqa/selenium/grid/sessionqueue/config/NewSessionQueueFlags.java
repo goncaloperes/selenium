@@ -27,6 +27,7 @@ import org.openqa.selenium.grid.config.ConfigValue;
 import org.openqa.selenium.grid.config.HasRoles;
 import org.openqa.selenium.grid.config.Role;
 
+import java.net.URI;
 import java.util.Collections;
 import java.util.Set;
 
@@ -34,18 +35,22 @@ import java.util.Set;
 public class NewSessionQueueFlags implements HasRoles {
 
   @Parameter(
-    names = { "--session-request-timeout" },
-    description = "Timeout in seconds. New incoming session request is added to the queue. "
-      + "Requests sitting in the queue for longer than the configured time will timeout.")
-  @ConfigValue(section = "sessionqueue", name = "session-request-timeout", example = "5")
-  private int sessionRequestTimeout = 300;
+    names = { "--sq",  "--sessionqueue" },
+    description = "Address of the session queue server.")
+  @ConfigValue(section = "sessionqueue", name = "host", example = "\"http://localhost:1237\"")
+  private URI sessionQueueServer;
 
   @Parameter(
-    names = { "--session-retry-interval" },
-    description = "Retry interval in seconds. If all slots are busy, new session request " +
-      "will be retried after the given interval.")
-  @ConfigValue(section = "sessionqueue", name = "session-retry-interval", example = "5")
-  private int sessionRetryInterval = 5;
+    names = "--sessionqueue-port",
+    description = "Port on which the session queue server is listening.")
+  @ConfigValue(section = "sessionqueue", name = "port", example = "1234")
+  private Integer sessionQueueServerPort;
+
+  @Parameter(
+    names = "--sessionqueue-host",
+    description = "Host on which the session queue server is listening.")
+  @ConfigValue(section = "sessionqueue", name = "hostname", example = "\"localhost\"")
+  private String sessionQueueServerHost;
 
   @Override
   public Set<Role> getRoles() {

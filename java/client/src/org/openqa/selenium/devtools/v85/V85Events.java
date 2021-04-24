@@ -70,7 +70,6 @@ public class V85Events extends Events<ConsoleAPICalled, ExceptionThrown> {
       .map(obj -> new RemoteObject(
         obj.getType().toString(),
         obj.getValue().orElse(null)))
-      .map(obj -> (Object) obj)
       .collect(ImmutableList.toImmutableList());
 
     return new ConsoleEvent(
@@ -83,8 +82,14 @@ public class V85Events extends Events<ConsoleAPICalled, ExceptionThrown> {
   protected JavascriptException toJsException(ExceptionThrown event) {
     ExceptionDetails details = event.getExceptionDetails();
     Optional<StackTrace> maybeTrace = details.getStackTrace();
+    Optional<org.openqa.selenium.devtools.v85.runtime.model.RemoteObject>
+      maybeException = details.getException();
 
-    JavascriptException exception = new JavascriptException(event.getExceptionDetails().getText());
+    String message = maybeException
+      .flatMap(obj -> obj.getDescription().map(String::toString))
+      .orElseGet(details::getText);
+
+    JavascriptException exception = new JavascriptException(message);
 
     if (!maybeTrace.isPresent()) {
       StackTraceElement element = new StackTraceElement(
@@ -108,5 +113,4 @@ public class V85Events extends Events<ConsoleAPICalled, ExceptionThrown> {
 
     return exception;
   }
-
 }

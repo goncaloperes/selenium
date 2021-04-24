@@ -25,7 +25,10 @@ import com.google.auto.service.AutoService;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
+import org.junit.experimental.categories.Category;
+import org.openqa.selenium.testing.UnitTests;
 
+@Category(UnitTests.class)
 public class HttpClientFactoryTest {
 
   private String oldProperty;
@@ -52,8 +55,8 @@ public class HttpClientFactoryTest {
 
   @Test
   public void canCreateHttpClientFactoryByName() {
-    HttpClient.Factory factory = HttpClient.Factory.create("reactor");
-    assertThat(factory.getClass().getAnnotation(HttpClientName.class).value()).isEqualTo("reactor");
+    HttpClient.Factory factory = HttpClient.Factory.create("netty");
+    assertThat(factory.getClass().getAnnotation(HttpClientName.class).value()).isEqualTo("netty");
   }
 
   @Test

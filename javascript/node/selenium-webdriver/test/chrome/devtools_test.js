@@ -26,7 +26,7 @@ const error = require('../../lib/error')
 const fileServer = require('../../lib/test/fileserver')
 const io = require('../../io')
 const test = require('../../lib/test')
-const Server = require('../../lib/test/httpserver').Server
+const until = require('../../lib/until')
 
 test.suite(
   function (env) {
@@ -42,31 +42,31 @@ test.suite(
 
     it('can send commands to devtools', async function () {
       await driver.get(test.Pages.ajaxyPage)
-      assert.equal(await driver.getCurrentUrl(), test.Pages.ajaxyPage)
+      assert.strictEqual(await driver.getCurrentUrl(), test.Pages.ajaxyPage)
 
       await driver.sendDevToolsCommand('Page.navigate', {
         url: test.Pages.echoPage,
       })
-      assert.equal(await driver.getCurrentUrl(), test.Pages.echoPage)
+      assert.strictEqual(await driver.getCurrentUrl(), test.Pages.echoPage)
     })
 
     it('can send commands to devtools and get return', async function () {
       await driver.get(test.Pages.ajaxyPage)
-      assert.equal(await driver.getCurrentUrl(), test.Pages.ajaxyPage)
+      assert.strictEqual(await driver.getCurrentUrl(), test.Pages.ajaxyPage)
 
       await driver.get(test.Pages.echoPage)
-      assert.equal(await driver.getCurrentUrl(), test.Pages.echoPage)
+      assert.strictEqual(await driver.getCurrentUrl(), test.Pages.echoPage)
 
       let history = await driver.sendAndGetDevToolsCommand(
         'Page.getNavigationHistory'
       )
       assert(history)
       assert(history.currentIndex >= 2)
-      assert.equal(
+      assert.strictEqual(
         history.entries[history.currentIndex].url,
         test.Pages.echoPage
       )
-      assert.equal(
+      assert.strictEqual(
         history.entries[history.currentIndex - 1].url,
         test.Pages.ajaxyPage
       )
@@ -98,70 +98,64 @@ test.suite(
     describe('JS CDP events', function () {
       it('calls the event listener for console.log', async function () {
         const cdpConnection = await driver.createCDPConnection('page')
-        await driver.onLogEvent(cdpConnection, function(event) {
-          assert.equal(event['args'][0]['value'], 'here')
+        await driver.onLogEvent(cdpConnection, function (event) {
+          assert.strictEqual(event['args'][0]['value'], 'here')
         })
         await driver.executeScript('console.log("here")')
       })
 
       it('calls the event listener for js exceptions', async function () {
         const cdpConnection = await driver.createCDPConnection('page')
-        await driver.onLogException(cdpConnection, function(event) {
-          assert.equal(event['exceptionDetails']['stackTrace']['callFrames'][0]['functionName'], 'onmouseover')
+        await driver.onLogException(cdpConnection, function (event) {
+          assert.strictEqual(
+            event['exceptionDetails']['stackTrace']['callFrames'][0][
+            'functionName'
+            ],
+            'onmouseover'
+          )
         })
         await driver.get(test.Pages.javascriptPage)
-        let element = driver.findElement({id: 'throwing-mouseover'})
+        let element = driver.findElement({ id: 'throwing-mouseover' })
         await element.click()
       })
     })
 
-    describe('Basic Auth Injection', function () {
-      const server = new Server(function(req, res) {
-        if (req.method == 'GET' && req.url == '/protected') {
-          const denyAccess = function () {
-            res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="test"' })
-            res.end('Access denied')
-          }
+    describe('JS DOM events', function () {
+      it('calls the event listener on dom mutations', async function () {
+        const cdpConnection = await driver.createCDPConnection('page')
+        await driver.logMutationEvents(cdpConnection, function (event) {
+          assert.strictEqual(event['attribute_name'], 'style')
+          assert.strictEqual(event['current_value'], '')
+          assert.strictEqual(event['old_value'], 'display:none;')
+        })
 
-          const basicAuthRegExp = /^\s*basic\s+([a-z0-9\-\._~\+\/]+)=*\s*$/i
-          const auth = req.headers.authorization
-          const match = basicAuthRegExp.exec(auth || '')
-          if (!match) {
-            denyAccess()
-            return
-          }
+        await driver.get(fileServer.Pages.dynamicPage)
 
-          const userNameAndPass = Buffer.from(match[1], 'base64').toString()
-          const parts = userNameAndPass.split(':', 2)
-          if (parts[0] !== 'genie' && parts[1] !== 'bottle') {
-            denyAccess()
-            return
-          }
-
-          res.writeHead(200, { 'content-type': 'text/plain' })
-          res.end('Access granted!')
-        }
+        let element = driver.findElement({ id: 'reveal' })
+        await element.click()
+        let revealed = driver.findElement({ id: 'revealed' })
+        await driver.wait(until.elementIsVisible(revealed), 5000)
       })
+    })
 
-      server.start()
+    describe('Basic Auth Injection', function () {
 
-      it('denies entry if username and password do not match', async function() {
+      it('denies entry if username and password do not match', async function () {
         const pageCdpConnection = await driver.createCDPConnection('page')
 
         await driver.register('random', 'random', pageCdpConnection)
-        await driver.get(server.url() + '/protected')
+        await driver.get(fileServer.Pages.basicAuth)
         let source = await driver.getPageSource()
-        assert.equal(source.includes('Access granted!'), false)
+        assert.strictEqual(source.includes('Access granted!'), false)
       })
 
-      it('grants access if username and password are a match', async function() {
+      it('grants access if username and password are a match', async function () {
         const pageCdpConnection = await driver.createCDPConnection('page')
 
         await driver.register('genie', 'bottle', pageCdpConnection)
-        await driver.get(server.url() + '/protected')
+        await driver.get(fileServer.Pages.basicAuth)
         let source = await driver.getPageSource()
-        assert.equal(source.includes('Access granted!'), true)
-        await server.stop()
+        assert.strictEqual(source.includes('Access granted!'), true)
       })
     })
 
@@ -183,7 +177,7 @@ test.suite(
           __dirname,
           '../../lib/test/data/firefox/webextension.xpi'
         )
-        assert.equal(
+        assert.strictEqual(
           fs.readFileSync(downloadPath, 'binary'),
           fs.readFileSync(goldenPath, 'binary')
         )

@@ -52,7 +52,7 @@ public class PersistentCapabilities implements Capabilities {
     Require.nonNull("Name", name);
     Require.nonNull("Value", value);
 
-    return new PersistentCapabilities(caps, new ImmutableCapabilities(name, value));
+    return new PersistentCapabilities(this, new ImmutableCapabilities(name, value));
   }
 
   @Override
@@ -97,7 +97,7 @@ public class PersistentCapabilities implements Capabilities {
 
   @Override
   public String toString() {
-    return asMap().toString();
+    return org.openqa.selenium.SharedCapabilitiesMethods.toString(asMap());
   }
 
   @Override

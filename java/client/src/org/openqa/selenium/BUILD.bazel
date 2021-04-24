@@ -1,5 +1,6 @@
 load("//java:version.bzl", "SE_VERSION")
 load("//java:defs.bzl", "java_dist_zip", "java_export", "java_import", "java_library", "javadoc")
+load("//java/client/src/org/openqa/selenium/devtools:versions.bzl", "CDP_DEPS")
 
 filegroup(
     name = "template-pom",
@@ -18,12 +19,16 @@ java_export(
         "mobile/*.java",
         "net/*.java",
         "virtualauthenticator/*.java",
+        "print/*.java",
     ]),
     hides = [
         "org.openqa.selenium.interactions.internal",
         "org.openqa.selenium.internal",
     ],
     maven_coordinates = "org.seleniumhq.selenium:selenium-api:%s" % SE_VERSION,
+    opens_to = [
+        "org.openqa.selenium.json",
+    ],
     pom_template = ":template-pom",
     visibility = ["//visibility:public"],
     deps = [
@@ -40,7 +45,6 @@ java_export(
         ":core",
         "//java/client/src/org/openqa/selenium/chrome",
         "//java/client/src/org/openqa/selenium/edge",
-        "//java/client/src/org/openqa/selenium/edgehtml",
         "//java/client/src/org/openqa/selenium/firefox",
         "//java/client/src/org/openqa/selenium/firefox/xpi",
         "//java/client/src/org/openqa/selenium/ie",
@@ -48,13 +52,9 @@ java_export(
         "//java/client/src/org/openqa/selenium/remote",
         "//java/client/src/org/openqa/selenium/safari",
         "//java/client/src/org/openqa/selenium/support",
-    ],
-)
-
-javadoc(
-    name = "core-docs",
-    deps = [
-        ":core",
+    ] + CDP_DEPS,
+    visibility = [
+        "//visibility:public",
     ],
 )
 
@@ -78,7 +78,7 @@ javadoc(
     third_party_prefixes = [
         "@maven//",
         "//third_party",
-    ],
+    ] + CDP_DEPS,
     transitive = True,
     deps = [
         ":client-combined",

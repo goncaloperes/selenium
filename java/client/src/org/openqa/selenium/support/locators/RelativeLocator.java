@@ -23,9 +23,7 @@ import com.google.common.io.Resources;
 import org.openqa.selenium.By;
 import org.openqa.selenium.JavascriptExecutor;
 import org.openqa.selenium.SearchContext;
-import org.openqa.selenium.WebDriver;
 import org.openqa.selenium.WebElement;
-import org.openqa.selenium.WrapsDriver;
 import org.openqa.selenium.internal.Require;
 import org.openqa.selenium.json.Json;
 import org.openqa.selenium.json.JsonException;
@@ -39,10 +37,42 @@ import java.util.Map;
 
 import static org.openqa.selenium.json.Json.MAP_TYPE;
 
+/**
+ * Used for finding elements by their location on a page, rather than their
+ * position on the DOM. Elements are returned ordered by their proximity to
+ * the last anchor element used for finding them. As an example:
+ * <pre>
+ *   List<WebElement> elements = driver.findElements(withTagName("p").above(lowest));
+ * </pre>
+ * Would return all {@code p} elements above the {@link WebElement}
+ * {@code lowest} sorted by the proximity to {@code lowest}.
+ * <p>
+ * Proximity is determined by simply comparing the distance to the center
+ * point of each of the elements in turn. For some non-rectangular shapes
+ * (such as paragraphs of text that take more than one line), this may lead
+ * to some surprising results.
+ * <p>
+ * In addition, be aware that the relative locators all use the "client
+ * bounding rect" of elements to determine whether something is "left",
+ * "right", "above" or "below" of another. Given the example:
+ * <pre>
+ *   +-----+
+ *   |  a  |---+
+ *   +-----+ b |
+ *       +-----+
+ * </pre>
+ * Where {@code a} partially overlaps {@code b}, {@code b} is none of
+ * "above", "below", "left" or "right" of {@code a}. This is because of
+ * how these are calculated using the box model. {@code b}'s bounding
+ * rect has it's left-most edge to the right of {@code a}'s bounding
+ * rect's right-most edge, so it is not considered to be "right" of
+ * {@code a}. Similar logic applies for the other directions.
+ */
 public class RelativeLocator {
 
   private static final Json JSON = new Json();
   private static final String FIND_ELEMENTS;
+
   static {
     try {
       String location = String.format(
@@ -58,12 +88,19 @@ public class RelativeLocator {
       throw new UncheckedIOException(e);
     }
   }
-  public static RelativeBy withTagName(String tagName) {
-    Require.nonNull("Tag name to look for", tagName);
-    return new RelativeBy(By.tagName(tagName));
+
+  private static final int CLOSE_IN_PIXELS = 100;
+
+  /**
+   * Start of a relative locator, finding elements by tag name.
+   */
+
+  public static RelativeBy with(By by) {
+    Require.nonNull("By to look for", by);
+    return new RelativeBy(by);
   }
 
-  public static class RelativeBy extends By {
+  public static class RelativeBy extends By implements By.Remotable {
     private final Object root;
     private final List<Map<String, Object>> filters;
 
@@ -134,7 +171,7 @@ public class RelativeLocator {
 
     public RelativeBy near(WebElement element) {
       Require.nonNull("Element to search near", element);
-      return near(element, 50);
+      return near(element, CLOSE_IN_PIXELS);
     }
 
     public RelativeBy near(WebElement element, int atMostDistanceInPixels) {
@@ -146,7 +183,7 @@ public class RelativeLocator {
 
     public RelativeBy near(By locator) {
       Require.nonNull("Locator", locator);
-      return near((Object) locator, 50);
+      return near((Object) locator, CLOSE_IN_PIXELS);
     }
 
     public RelativeBy near(By locator, int atMostDistanceInPixels) {
@@ -164,15 +201,15 @@ public class RelativeLocator {
         root,
         amend(ImmutableMap.of(
           "kind", "near",
-          "args", ImmutableList.of(asAtomLocatorParameter(locator), "distance", atMostDistanceInPixels))));
+          "args", ImmutableList.of(asAtomLocatorParameter(locator), atMostDistanceInPixels))));
     }
 
     @Override
     public List<WebElement> findElements(SearchContext context) {
-      JavascriptExecutor js = extractJsExecutor(context);
+      JavascriptExecutor js = getJavascriptExecutor(context);
 
       @SuppressWarnings("unchecked")
-      List<WebElement> elements = (List<WebElement>) js.executeScript(FIND_ELEMENTS, this.toJson());
+      List<WebElement> elements = (List<WebElement>) js.executeScript(FIND_ELEMENTS, asAtomLocatorParameter(this));
       return elements;
     }
 
@@ -185,7 +222,6 @@ public class RelativeLocator {
         amend(ImmutableMap.of(
           "kind", direction,
           "args", ImmutableList.of(asAtomLocatorParameter(locator)))));
-
     }
 
     private List<Map<String, Object>> amend(Map<String, Object> toAdd) {
@@ -195,28 +231,17 @@ public class RelativeLocator {
         .build();
     }
 
-    private JavascriptExecutor extractJsExecutor(SearchContext context) {
-      if (context instanceof JavascriptExecutor) {
-        return (JavascriptExecutor) context;
-      }
-
-      Object current = context;
-      while (current instanceof WrapsDriver) {
-        WebDriver driver = ((WrapsDriver) context).getWrappedDriver();
-        if (driver instanceof JavascriptExecutor) {
-          return (JavascriptExecutor) driver;
-        }
-        current = driver;
-      }
-
-      throw new IllegalArgumentException("Cannot find elements, since the context cannot execute JS: " + context);
+    @Override
+    public Parameters getRemoteParameters() {
+      return new Parameters(
+        "relative",
+        ImmutableMap.of("root", root, "filters", filters));
     }
 
     private Map<String, Object> toJson() {
       return ImmutableMap.of(
-        "relative", ImmutableMap.of(
-          "root", root,
-          "filters", filters));
+        "using", "relative",
+        "value", ImmutableMap.of("root", root, "filters", filters));
     }
   }
 

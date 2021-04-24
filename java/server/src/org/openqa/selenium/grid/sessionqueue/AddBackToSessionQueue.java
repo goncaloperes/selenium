@@ -17,15 +17,15 @@
 
 package org.openqa.selenium.grid.sessionqueue;
 
+import static java.util.Collections.singletonMap;
 import static org.openqa.selenium.remote.http.Contents.asJson;
 import static org.openqa.selenium.remote.tracing.HttpTracing.newSpanAsChildOf;
 import static org.openqa.selenium.remote.tracing.Tags.HTTP_REQUEST;
 import static org.openqa.selenium.remote.tracing.Tags.HTTP_RESPONSE;
 
-import com.google.common.collect.ImmutableMap;
-
 import org.openqa.selenium.grid.data.RequestId;
 import org.openqa.selenium.internal.Require;
+import org.openqa.selenium.remote.http.Contents;
 import org.openqa.selenium.remote.http.HttpHandler;
 import org.openqa.selenium.remote.http.HttpRequest;
 import org.openqa.selenium.remote.http.HttpResponse;
@@ -33,32 +33,32 @@ import org.openqa.selenium.remote.tracing.AttributeKey;
 import org.openqa.selenium.remote.tracing.Span;
 import org.openqa.selenium.remote.tracing.Tracer;
 
-import java.util.UUID;
-
 class AddBackToSessionQueue implements HttpHandler {
 
   private final Tracer tracer;
-  private final NewSessionQueuer newSessionQueuer;
+  private final NewSessionQueue newSessionQueue;
   private final RequestId id;
 
-  AddBackToSessionQueue(Tracer tracer, NewSessionQueuer newSessionQueuer, RequestId id) {
+  AddBackToSessionQueue(Tracer tracer, NewSessionQueue newSessionQueue, RequestId id) {
     this.tracer = Require.nonNull("Tracer", tracer);
-    this.newSessionQueuer = Require.nonNull("New Session Queuer", newSessionQueuer);
+    this.newSessionQueue = Require.nonNull("New Session Queue", newSessionQueue);
     this.id = id;
   }
 
   @Override
   public HttpResponse execute(HttpRequest req) {
-    try (Span span = newSpanAsChildOf(tracer, req, "sessionqueuer.retry")) {
+    try (Span span = newSpanAsChildOf(tracer, req, "sessionqueue.retry")) {
       HTTP_REQUEST.accept(span, req);
       span.setAttribute(AttributeKey.REQUEST_ID.getKey(), id.toString());
 
-      boolean value = newSessionQueuer.retryAddToQueue(req, id);
+      SessionRequest sessionRequest = Contents.fromJson(req, SessionRequest.class);
+
+      boolean value = newSessionQueue.retryAddToQueue(sessionRequest);
 
       span.setAttribute("request.retry", value);
 
-      HttpResponse response = new HttpResponse().setContent(
-          asJson(ImmutableMap.of("value", value)));
+      HttpResponse response = new HttpResponse()
+        .setContent(asJson(singletonMap("value", value)));
 
       HTTP_RESPONSE.accept(span, response);
 

@@ -29,7 +29,14 @@ const input = require('./input')
 const logging = require('./logging')
 const promise = require('./promise')
 const Symbols = require('./symbols')
+const cdpTargets = ['page', 'browser']
+const cdp = require('../devtools/CDPConnection')
+const WebSocket = require('ws')
+const http = require('../http/index')
+const fs = require('fs')
 const { Capabilities } = require('./capabilities')
+const path = require('path')
+const { NoSuchElementError } = require('./error')
 
 // Capability names that are defined in the W3C spec.
 const W3C_CAPABILITY_NAMES = new Set([
@@ -239,14 +246,14 @@ class IWebDriver {
    *     result.
    * @template T
    */
-  execute(command) {} // eslint-disable-line
+  execute(command) { } // eslint-disable-line
 
   /**
    * Sets the {@linkplain input.FileDetector file detector} that should be
    * used with this instance.
    * @param {input.FileDetector} detector The detector to use or `null`.
    */
-  setFileDetector(detector) {} // eslint-disable-line
+  setFileDetector(detector) { } // eslint-disable-line
 
   /**
    * @return {!command.Executor} The command executor used by this instance.
@@ -285,7 +292,7 @@ class IWebDriver {
    *     for details).
    * @return {!input.Actions} A new action sequence for this instance.
    */
-  actions(options) {} // eslint-disable-line
+  actions(options) { } // eslint-disable-line
 
   /**
    * Executes a snippet of JavaScript in the context of the currently selected
@@ -323,7 +330,7 @@ class IWebDriver {
    *    scripts return value.
    * @template T
    */
-  executeScript(script, ...args) {} // eslint-disable-line
+  executeScript(script, ...args) { } // eslint-disable-line
 
   /**
    * Executes a snippet of asynchronous JavaScript in the context of the
@@ -400,7 +407,7 @@ class IWebDriver {
    *     value.
    * @template T
    */
-  executeAsyncScript(script, ...args) {} // eslint-disable-line
+  executeAsyncScript(script, ...args) { } // eslint-disable-line
 
   /**
    * Waits for a condition to evaluate to a "truthy" value. The condition may be
@@ -460,7 +467,7 @@ class IWebDriver {
    * @return {!Promise<void>} A promise that will be resolved when the sleep has
    *     finished.
    */
-  sleep(ms) {} // eslint-disable-line
+  sleep(ms) { } // eslint-disable-line
 
   /**
    * Retrieves the current window handle.
@@ -503,7 +510,7 @@ class IWebDriver {
    * @return {!Promise<void>} A promise that will be resolved when the document
    *     has finished loading.
    */
-  get(url) {} // eslint-disable-line
+  get(url) { } // eslint-disable-line
 
   /**
    * Retrieves the URL for the current page.
@@ -559,7 +566,7 @@ class IWebDriver {
    *     commands against the located element. If the element is not found, the
    *     element will be invalidated and all scheduled commands aborted.
    */
-  findElement(locator) {} // eslint-disable-line
+  findElement(locator) { } // eslint-disable-line
 
   /**
    * Search for multiple elements on the page. Refer to the documentation on
@@ -569,7 +576,7 @@ class IWebDriver {
    * @return {!Promise<!Array<!WebElement>>} A promise that will resolve to an
    *     array of WebElements.
    */
-  findElements(locator) {} // eslint-disable-line
+  findElements(locator) { } // eslint-disable-line
 
   /**
    * Takes a screenshot of the current page. The driver makes a best effort to
@@ -600,6 +607,25 @@ class IWebDriver {
    *     instance.
    */
   switchTo() {}
+
+  /**
+   *
+   * Takes a PDF of the current page. The driver makes a best effort to
+   * return a PDF based on the provided parameters.
+   *
+   * @param {{orientation: (string|undefined),
+   *         scale: (number|undefined),
+   *         background: (boolean|undefined)
+   *         width: (number|undefined)
+   *         height: (number|undefined)
+   *         top: (number|undefined)
+   *         bottom: (number|undefined)
+   *         left: (number|undefined)
+   *         right: (number|undefined)
+   *         shrinkToFit: (boolean|undefined)
+   *         pageRanges: (<Array>|undefined)}} options.
+   */
+  printPage(options) { } // eslint-disable-line
 }
 
 /**
@@ -906,7 +932,7 @@ class WebDriver {
 
   /** @override */
   sleep(ms) {
-    return new Promise((resolve) => setTimeout(() => resolve(), ms))
+    return new Promise((resolve) => setTimeout(resolve, ms))
   }
 
   /** @override */
@@ -949,16 +975,46 @@ class WebDriver {
   /** @override */
   findElement(locator) {
     let id
-    locator = by.checkedLocator(locator)
+    let cmd = null
+
+    if (locator instanceof RelativeBy) {
+      cmd = new command.Command(
+        command.Name.FIND_ELEMENTS_RELATIVE
+      ).setParameter('args', locator.marshall())
+    } else {
+      locator = by.checkedLocator(locator)
+    }
+
     if (typeof locator === 'function') {
       id = this.findElementInternal_(locator, this)
-    } else {
-      let cmd = new command.Command(command.Name.FIND_ELEMENT)
+      return new WebElementPromise(this, id)
+    } else if (cmd === null) {
+      cmd = new command.Command(command.Name.FIND_ELEMENT)
         .setParameter('using', locator.using)
         .setParameter('value', locator.value)
-      id = this.execute(cmd)
     }
-    return new WebElementPromise(this, id)
+
+    id = this.execute(cmd)
+    if (locator instanceof RelativeBy) {
+      return this.normalize_(id)
+    } else {
+      return new WebElementPromise(this, id)
+    }
+  }
+
+  /**
+   * @param {!Function} webElementPromise The webElement in unresolved state
+   * @return {!Promise<!WebElement>} First single WebElement from array of resolved promises
+   */
+  async normalize_(webElementPromise) {
+    let result = await webElementPromise
+    if (result.length === 0) {
+      throw new NoSuchElementError(
+        'Cannot locate an element with provided parameters'
+      )
+    } else {
+      return result[0]
+    }
   }
 
   /**
@@ -1048,6 +1104,352 @@ class WebDriver {
   /** @override */
   switchTo() {
     return new TargetLocator(this)
+  }
+
+  validatePrintPageParams(keys, object) {
+    let page = {}
+    let margin = {}
+    let data
+    Object.keys(keys).forEach(function (key) {
+      data = keys[key]
+      let obj = {
+        orientation: function () {
+          object.orientation = data
+        },
+
+        scale: function () {
+          object.scale = data
+        },
+
+        background: function () {
+          object.background = data
+        },
+
+        width: function () {
+          page.width = data
+          object.page = page
+        },
+
+        height: function () {
+          page.height = data
+          object.page = page
+        },
+
+        top: function () {
+          margin.top = data
+          object.margin = margin
+        },
+
+        left: function () {
+          margin.left = data
+          object.margin = margin
+        },
+
+        bottom: function () {
+          margin.bottom = data
+          object.margin = margin
+        },
+
+        right: function () {
+          margin.right = data
+          object.margin = margin
+        },
+
+        shrinkToFit: function () {
+          object.shrinkToFit = data
+        },
+
+        pageRanges: function () {
+          object.pageRanges = data
+        },
+      }
+
+      if (!Object.prototype.hasOwnProperty.call(obj, key)) {
+        throw new error.InvalidArgumentError(`Invalid Argument '${key}'`)
+      } else {
+        obj[key]()
+      }
+    })
+
+    return object
+  }
+
+  /** @override */
+  printPage(options = {}) {
+    let keys = options
+    let params = {}
+    let resultObj
+
+    let self = this
+    resultObj = self.validatePrintPageParams(keys, params)
+
+    return this.execute(
+      new command.Command(command.Name.PRINT_PAGE).setParameters(resultObj)
+    )
+  }
+
+  /**
+   * Creates a new WebSocket connection.
+   * @return {!Promise<resolved>} A new CDP instance.
+   */
+  async createCDPConnection(target) {
+    const caps = await this.getCapabilities()
+    const seCdp = caps['map_'].get('se:cdp')
+    const vendorInfo =
+      caps['map_'].get(this.VENDOR_COMMAND_PREFIX + ':chromeOptions') ||
+      caps['map_'].get(this.VENDOR_CAPABILITY_PREFIX + ':edgeOptions') ||
+      caps['map_'].get('moz:debuggerAddress') ||
+      new Map()
+    const debuggerUrl = seCdp || vendorInfo['debuggerAddress'] || vendorInfo
+    this._wsUrl = await this.getWsUrl(debuggerUrl, target)
+
+    return new Promise((resolve, reject) => {
+      try {
+        this._wsConnection = new WebSocket(this._wsUrl)
+      } catch (err) {
+        reject(err)
+        return
+      }
+
+      this._wsConnection.on('open', () => {
+        this._cdpConnection = new cdp.CdpConnection(this._wsConnection)
+        resolve(this._cdpConnection)
+      })
+
+      this._wsConnection.on('error', (error) => {
+        reject(error)
+      })
+    })
+  }
+
+  /**
+   * Retrieves 'webSocketDebuggerUrl' by sending a http request using debugger address
+   * @param {string} debuggerAddress
+   * @param {string} target
+   * @return {string} Returns parsed webSocketDebuggerUrl obtained from the http request
+   */
+  async getWsUrl(debuggerAddress, target) {
+    if (target && cdpTargets.indexOf(target.toLowerCase()) === -1) {
+      throw new error.InvalidArgumentError('invalid target value')
+    }
+    let path
+    if (target === 'page') {
+      path = '/json'
+    } else {
+      path = '/json/version'
+    }
+    let request = new http.Request('GET', path)
+    let client = new http.HttpClient('http://' + debuggerAddress)
+    let response = await client.send(request)
+    let url
+    if (target.toLowerCase() === 'page') {
+      url = JSON.parse(response.body)[0]['webSocketDebuggerUrl']
+    } else {
+      url = JSON.parse(response.body)['webSocketDebuggerUrl']
+    }
+
+    return url
+  }
+
+  /**
+   * Sets a listener for Fetch.authRequired event from CDP
+   * If event is triggered, it enter username and password
+   * and allows the test to move forward
+   * @param {string} username
+   * @param {string} password
+   * @param connection CDP Connection
+   */
+  async register(username, password, connection) {
+    await connection.execute(
+      'Network.setCacheDisabled',
+      this.getRandomNumber(1, 10),
+      {
+        cacheDisabled: true,
+      },
+      null
+    )
+
+    this._wsConnection.on('message', (message) => {
+      const params = JSON.parse(message)
+
+      if (params.method === 'Fetch.authRequired') {
+        const requestParams = params['params']
+        connection.execute(
+          'Fetch.continueWithAuth',
+          this.getRandomNumber(1, 10),
+          {
+            requestId: requestParams['requestId'],
+            authChallengeResponse: {
+              response: 'ProvideCredentials',
+              username: username,
+              password: password,
+            },
+          }
+        )
+      } else if (params.method === 'Fetch.requestPaused') {
+        const requestPausedParams = params['params']
+        connection.execute(
+          'Fetch.continueRequest',
+          this.getRandomNumber(1, 10),
+          {
+            requestId: requestPausedParams['requestId'],
+          }
+        )
+      }
+    })
+
+    await connection.execute(
+      'Fetch.enable',
+      1,
+      {
+        handleAuthRequests: true,
+      },
+      null
+    )
+  }
+
+  /**
+   *
+   * @param connection
+   * @param callback
+   * @returns {Promise<void>}
+   */
+  async onLogEvent(connection, callback) {
+    await connection.execute(
+      'Runtime.enable',
+      this.getRandomNumber(1, 10),
+      {},
+      null
+    )
+
+    this._wsConnection.on('message', (message) => {
+      const params = JSON.parse(message)
+
+      if (params.method === 'Runtime.consoleAPICalled') {
+        const consoleEventParams = params['params']
+        let event = {
+          type: consoleEventParams['type'],
+          timestamp: new Date(consoleEventParams['timestamp']),
+          args: consoleEventParams['args'],
+        }
+
+        callback(event)
+      }
+    })
+  }
+
+  /**
+   *
+   * @param connection
+   * @param callback
+   * @returns {Promise<void>}
+   */
+  async onLogException(connection, callback) {
+    await connection.execute(
+      'Runtime.enable',
+      this.getRandomNumber(1, 10),
+      {},
+      null
+    )
+
+    this._wsConnection.on('message', (message) => {
+      const params = JSON.parse(message)
+
+      if (params.method === 'Runtime.exceptionThrown') {
+        const exceptionEventParams = params['params']
+        let event = {
+          exceptionDetails: exceptionEventParams['exceptionDetails'],
+          timestamp: new Date(exceptionEventParams['timestamp']),
+        }
+
+        callback(event)
+      }
+    })
+  }
+
+  /**
+   * @param connection
+   * @param callback
+   * @returns {Promise<void>}
+   */
+  async logMutationEvents(connection, callback) {
+    await connection.execute(
+      'Runtime.enable',
+      this.getRandomNumber(1, 10),
+      {},
+      null
+    )
+    await connection.execute(
+      'Page.enable',
+      this.getRandomNumber(1, 10),
+      {},
+      null
+    )
+
+    await connection.execute(
+      'Runtime.addBinding',
+      this.getRandomNumber(1, 10),
+      {
+        name: '__webdriver_attribute',
+      },
+      null
+    )
+
+    let mutationListener = ''
+    try {
+      // Depending on what is running the code it could appear in 2 different places which is why we try
+      // here and then the other location
+      mutationListener = fs
+        .readFileSync(
+          './javascript/node/selenium-webdriver/lib/atoms/mutation-listener.js',
+          'utf-8'
+        )
+        .toString()
+    } catch {
+      mutationListener = fs
+        .readFileSync(
+          path.resolve(__dirname, './atoms/mutation-listener.js'),
+          'utf-8'
+        )
+        .toString()
+    }
+
+    this.executeScript(mutationListener)
+
+    await connection.execute(
+      'Page.addScriptToEvaluateOnNewDocument',
+      this.getRandomNumber(1, 10),
+      {
+        source: mutationListener,
+      },
+      null
+    )
+
+    this._wsConnection.on('message', async (message) => {
+      const params = JSON.parse(message)
+      if (params.method === 'Runtime.bindingCalled') {
+        let payload = JSON.parse(params['params']['payload'])
+        let elements = await this.findElements({
+          css: '*[data-__webdriver_id=' + payload['target'],
+        })
+
+        if (elements.length === 0) {
+          return
+        }
+
+        let event = {
+          element: elements[0],
+          attribute_name: payload['name'],
+          current_value: payload['value'],
+          old_value: payload['oldValue'],
+        }
+        callback(event)
+      }
+    })
+  }
+
+  getRandomNumber(min, max) {
+    return Math.floor(Math.random() * (max - min + 1) + min)
   }
 }
 
@@ -2223,6 +2625,25 @@ class WebElement {
     return this.execute_(new command.Command(command.Name.GET_ELEMENT_TEXT))
   }
 
+  /**
+   * Get the computed WAI-ARIA role of element.
+   *
+   * @return {!Promise<string>} A promise that will be
+   *     resolved with the element's computed role.
+   */
+  getAriaRole() {
+    return this.execute_(new command.Command(command.Name.GET_COMPUTED_ROLE))
+  }
+
+  /**
+   * Get the computed WAI-ARIA label of element.
+   *
+   * @return {!Promise<string>} A promise that will be
+   *     resolved with the element's computed label.
+   */
+  getAccessibleName() {
+    return this.execute_(new command.Command(command.Name.GET_COMPUTED_LABEL))
+  }
   /**
    * Returns an object describing an element's location, in pixels relative to
    * the document element, and the element's size in pixels.

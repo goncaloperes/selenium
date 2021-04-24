@@ -60,10 +60,15 @@ class UnboundZmqEventBus implements EventBus {
   static final EventName REJECTED_EVENT = new EventName("selenium-rejected-event");
   private static final Logger LOG = Logger.getLogger(EventBus.class.getName());
   private static final Json JSON = new Json();
-  private final ExecutorService executor;
+  private final AtomicBoolean pollingStarted = new AtomicBoolean(false);
+  private final ExecutorService socketPollingExecutor;
+  private final ExecutorService socketPublishingExecutor;
+  private final ExecutorService listenerNotificationExecutor;
+
   private final Map<EventName, List<Consumer<Event>>> listeners = new ConcurrentHashMap<>();
   private final Queue<UUID> recentMessages = EvictingQueue.create(128);
   private final String encodedSecret;
+  private ZMQ.Poller poller;
 
   private ZMQ.Socket pub;
   private ZMQ.Socket sub;
@@ -76,12 +81,28 @@ class UnboundZmqEventBus implements EventBus {
     }
     this.encodedSecret = builder.toString();
 
-    executor = Executors.newCachedThreadPool(r -> {
+    this.socketPollingExecutor = Executors.newSingleThreadExecutor(r -> {
       Thread thread = new Thread(r);
-      thread.setName("Event Bus");
+      thread.setName("Event Bus Poller");
       thread.setDaemon(true);
       return thread;
     });
+
+    this.socketPublishingExecutor = Executors.newSingleThreadExecutor(r -> {
+      Thread thread = new Thread(r);
+      thread.setName("Event Bus Publisher");
+      thread.setDaemon(true);
+      return thread;
+    });
+
+    this.listenerNotificationExecutor = Executors.newFixedThreadPool(
+      Math.max(Runtime.getRuntime().availableProcessors() / 2, 2), // At least two threads
+      r -> {
+        Thread thread = new Thread(r);
+        thread.setName("Event Bus Listener Notifier");
+        thread.setDaemon(true);
+        return thread;
+      });
 
     String connectionMessage = String.format("Connecting to %s and %s", publishConnection, subscribeConnection);
     LOG.info(connectionMessage);
@@ -93,6 +114,7 @@ class UnboundZmqEventBus implements EventBus {
       .onRetry(e -> LOG.log(Level.WARNING, String.format("Failure #%s. Retrying.", e.getAttemptCount())))
       .onRetriesExceeded(e -> LOG.log(Level.WARNING, "Connection aborted."));
 
+    // Access to the zmq socket is safe here: no threads.
     Failsafe.with(retryPolicy).run(
       () -> {
         sub = context.createSocket(SocketType.SUB);
@@ -106,78 +128,31 @@ class UnboundZmqEventBus implements EventBus {
       }
     );
     // Connections are already established
-    ZMQ.Poller poller = context.createPoller(1);
-    poller.register(Objects.requireNonNull(sub), ZMQ.Poller.POLLIN);
+    this.poller = context.createPoller(1);
+    this.poller.register(Objects.requireNonNull(sub), ZMQ.Poller.POLLIN);
 
     LOG.info("Sockets created");
 
-    AtomicBoolean pollingStarted = new AtomicBoolean(false);
-
-    executor.submit(() -> {
-      LOG.info("Bus started");
-      while (!Thread.currentThread().isInterrupted()) {
-        try {
-          poller.poll(150);
-          pollingStarted.lazySet(true);
-
-          if (poller.pollin(0)) {
-            ZMQ.Socket socket = poller.getSocket(0);
-
-            EventName eventName = new EventName(new String(socket.recv(ZMQ.DONTWAIT), UTF_8));
-            Secret eventSecret = JSON.toType(new String(socket.recv(ZMQ.DONTWAIT), UTF_8), Secret.class);
-            UUID id = UUID.fromString(new String(socket.recv(ZMQ.DONTWAIT), UTF_8));
-            String data = new String(socket.recv(ZMQ.DONTWAIT), UTF_8);
-
-            Object converted = JSON.toType(data, Object.class);
-            Event event = new Event(id, eventName, converted);
-
-            if (recentMessages.contains(id)) {
-              continue;
-            }
-            recentMessages.add(id);
-
-            if (!Secret.matches(secret, eventSecret)) {
-              LOG.severe(String.format("Received message without a valid secret. Rejecting. %s -> %s", event, data));
-              Event rejectedEvent = new Event(REJECTED_EVENT, new ZeroMqEventBus.RejectedEvent(eventName, data));
-
-              listeners.getOrDefault(REJECTED_EVENT, new ArrayList<>())
-                .forEach(listener -> listener.accept(rejectedEvent));
-              return;
-            }
-
-            List<Consumer<Event>> typeListeners = listeners.get(eventName);
-            if (typeListeners == null) {
-              continue;
-            }
-
-            typeListeners.parallelStream().forEach(listener -> listener.accept(event));
-          }
-        } catch (Throwable e) {
-          if (e.getCause() != null && e.getCause() instanceof AssertionError) {
-            // Do nothing.
-          } else {
-            throw e;
-          }
-        }
-      }
-    });
+    socketPollingExecutor.submit(new PollingRunnable(secret));
 
     // Give ourselves up to a second to connect, using The World's Worst heuristic. If we don't
     // manage to connect, it's not the end of the world, as the socket we're connecting to may not
     // be up yet.
     while (!pollingStarted.get()) {
       try {
-        Thread.sleep(100);
+        Thread.sleep(1000);
       } catch (InterruptedException e) {
         Thread.currentThread().interrupt();
         throw new RuntimeException(e);
       }
     }
+
+    LOG.info("Event bus ready");
   }
 
   @Override
   public boolean isReady() {
-    return !executor.isShutdown();
+    return !socketPollingExecutor.isShutdown();
   }
 
   private boolean isSubAddressIPv6(String connection) {
@@ -207,20 +182,99 @@ class UnboundZmqEventBus implements EventBus {
   public void fire(Event event) {
     Require.nonNull("Event to send", event);
 
-    pub.sendMore(event.getType().getName().getBytes(UTF_8));
-    pub.sendMore(encodedSecret.getBytes(UTF_8));
-    pub.sendMore(event.getId().toString().getBytes(UTF_8));
-    pub.send(event.getRawData().getBytes(UTF_8));
+    socketPublishingExecutor.execute(() -> {
+      pub.sendMore(event.getType().getName().getBytes(UTF_8));
+      pub.sendMore(encodedSecret.getBytes(UTF_8));
+      pub.sendMore(event.getId().toString().getBytes(UTF_8));
+      pub.send(event.getRawData().getBytes(UTF_8));
+    });
   }
 
   @Override
   public void close() {
-    executor.shutdown();
+    socketPollingExecutor.shutdownNow();
+    socketPublishingExecutor.shutdownNow();
+    listenerNotificationExecutor.shutdownNow();
+    poller.close();
+
     if (sub != null) {
       sub.close();
     }
     if (pub != null) {
       pub.close();
+    }
+  }
+
+  private class PollingRunnable implements Runnable {
+    private Secret secret;
+
+    public PollingRunnable(Secret secret) {
+      this.secret = secret;
+    }
+
+    @Override
+    public void run() {
+      while (!Thread.currentThread().isInterrupted()) {
+        try {
+          int count = poller.poll(150);
+
+          pollingStarted.lazySet(true);
+
+          for (int i = 0; i < count; i++) {
+            if (poller.pollin(i)) {
+              ZMQ.Socket socket = poller.getSocket(i);
+
+              EventName eventName = new EventName(new String(socket.recv(), UTF_8));
+              Secret eventSecret =
+                JSON.toType(new String(socket.recv(), UTF_8), Secret.class);
+              UUID id = UUID.fromString(new String(socket.recv(), UTF_8));
+              String data = new String(socket.recv(), UTF_8);
+
+              // Don't bother doing more work if we've seen this message.
+              if (recentMessages.contains(id)) {
+                return;
+              }
+
+              Object converted = JSON.toType(data, Object.class);
+              Event event = new Event(id, eventName, converted);
+
+              recentMessages.add(id);
+
+              if (!Secret.matches(secret, eventSecret)) {
+                LOG.log(Level.SEVERE, "Received message without a valid secret. Rejecting. {0} -> {1}",
+                  new Object[]{event, data}); // String formatting only applied if needed
+                Event rejectedEvent =
+                  new Event(REJECTED_EVENT, new ZeroMqEventBus.RejectedEvent(eventName, data));
+
+                notifyListeners(REJECTED_EVENT, rejectedEvent);
+
+                return;
+              }
+              notifyListeners(eventName, event);
+            }
+          }
+        } catch (Exception e) {
+          if (e.getCause() instanceof AssertionError) {
+            // Do nothing.
+          } else {
+            LOG.log(Level.WARNING, e, () -> "Caught exception while polling for event bus messages: "
+              + e.getMessage());
+            throw e;
+          }
+        }
+      }
+    }
+
+    private void notifyListeners(EventName eventName, Event event) {
+      List<Consumer<Event>> eventListeners = listeners.getOrDefault(eventName, new ArrayList<>());
+      eventListeners
+        .forEach(listener -> listenerNotificationExecutor.submit(() -> {
+          try {
+            listener.accept(event);
+          } catch (Exception e) {
+            LOG.log(Level.WARNING, e, () -> "Caught exception from listener: " + listener);
+          }
+        }));
     }
   }
 }

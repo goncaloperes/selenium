@@ -1,4 +1,5 @@
 load("@rules_jvm_external//:defs.bzl", "artifact")
+load("//java/private:selenium_test.bzl", "BROWSERS")
 load("//java:defs.bzl", "java_binary", "java_library", "java_test_suite")
 
 filegroup(
@@ -36,9 +37,7 @@ java_library(
         "@com_google_javascript_closure_library",
     ],
     javacopts = [
-        "-source",
-        "11",
-        "-target",
+        "--release",
         "11",
     ],
     visibility = [
@@ -55,20 +54,16 @@ java_library(
         "//java/server/src/org/openqa/selenium/grid/config",
         "//java/server/src/org/openqa/selenium/grid/server",
         "//java/server/src/org/openqa/selenium/grid/web",
-        "//java/server/src/org/openqa/selenium/jre/server",
+        "//java/server/src/org/openqa/selenium/netty/server",
         artifact("com.google.guava:guava"),
-        artifact("org.eclipse.jetty:jetty-http"),
-        artifact("org.eclipse.jetty:jetty-server"),
-        artifact("org.eclipse.jetty:jetty-servlet"),
-        artifact("org.eclipse.jetty:jetty-util"),
-        artifact("javax.servlet:javax.servlet-api"),
+        artifact("org.assertj:assertj-core"),
     ],
 )
 
 java_binary(
     name = "appserver",
     testonly = True,
-    main_class = "org.openqa.selenium.environment.webserver.JettyAppServer",
+    main_class = "org.openqa.selenium.environment.webserver.NettyAppServer",
     visibility = [
         "//:__pkg__",
         "//dotnet/test:__subpackages__",
@@ -104,12 +99,18 @@ java_library(
     ],
 )
 
+firefox = BROWSERS["firefox"]
+
 java_test_suite(
     name = "MediumTests",
     size = "medium",
     srcs = glob(["**/*Test.java"]),
+    data = firefox["data"],
+    jvm_flags = firefox["jvm_flags"],
+    tags = firefox["tags"],
     deps = [
         ":environment",
         ":test-base",
-    ],
+        artifact("junit:junit"),
+    ] + firefox["deps"],
 )

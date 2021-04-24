@@ -12,7 +12,6 @@ java_test_suite(
         "//java/server/src/org/openqa/selenium/grid/config",
         "//java/server/src/org/openqa/selenium/grid/server",
         "//java/server/src/org/openqa/selenium/grid/web",
-        "//java/server/src/org/openqa/selenium/jetty/server",
         "//java/server/src/org/openqa/selenium/jre/server",
         "//java/server/test/org/openqa/testing",
         artifact("com.google.guava:guava"),

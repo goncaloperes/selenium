@@ -82,10 +82,7 @@ const command = require('./lib/command')
 const error = require('./lib/error')
 const Symbols = require('./lib/symbols')
 const webdriver = require('./lib/webdriver')
-const WebSocket = require('ws')
-const cdp = require('./devtools/CDPConnection')
 const remote = require('./remote')
-const cdpTargets = ['page', 'browser']
 
 /**
  * Custom command names supported by Chromium WebDriver.
@@ -111,9 +108,9 @@ const Command = {
  * @return {!command.Executor} The new command executor.
  */
 function createExecutor(url, vendorPrefix) {
-  let agent = new http.Agent({ keepAlive: true })
-  let client = url.then((url) => new http.HttpClient(url, agent))
-  let executor = new http.Executor(client)
+  const agent = new http.Agent({ keepAlive: true })
+  const client = url.then((url) => new http.HttpClient(url, agent))
+  const executor = new http.Executor(client)
   configureExecutor(executor, vendorPrefix)
   return executor
 }
@@ -393,7 +390,7 @@ class Options extends Capabilities {
    * - `enableTimeline`: Whether or not to collect events from Timeline domain.
    *     Note: when tracing is enabled, Timeline domain is implicitly disabled,
    *     unless `enableTimeline` is explicitly set to true.
-   * - `tracingCategories`: A comma-separated string of Chromium tracing
+   * - `traceCategories`: A comma-separated string of Chromium tracing
    *     categories for which trace events should be collected. An unspecified
    *     or empty string disables tracing.
    * - `bufferUsageReportingInterval`: The requested number of milliseconds
@@ -404,7 +401,7 @@ class Options extends Capabilities {
    * @param {{enableNetwork: boolean,
    *          enablePage: boolean,
    *          enableTimeline: boolean,
-   *          tracingCategories: string,
+   *          traceCategories: string,
    *          bufferUsageReportingInterval: number}} prefs The performance
    *     logging preferences.
    * @return {!Options} A self reference.
@@ -553,6 +550,22 @@ class Options extends Capabilities {
   }
 
   /**
+   * Sets a list of the window types that will appear when getting window
+   * handles. For access to <webview> elements, include "webview" in the list.
+   * @param {...(string|!Array<string>)} args The window types that will appear
+   * when getting window handles.
+   * @return {!Options} A self reference.
+   */
+  windowTypes(...args) {
+    let windowTypes = (this.options_.windowTypes || []).concat(...args);
+    if (windowTypes.length) {
+      this.options_.windowTypes = windowTypes;
+    }
+    return this;
+  }
+
+
+  /**
    * Converts this instance to its JSON wire protocol representation. Note this
    * function is an implementation not intended for general use.
    *
@@ -568,7 +581,7 @@ class Options extends Capabilities {
           return extension.toString('base64')
         }
         return io
-          .read(/** @type {string} */ (extension))
+          .read(/** @type {string} */(extension))
           .then((buffer) => buffer.toString('base64'))
       })
     }
@@ -621,7 +634,7 @@ class Driver extends webdriver.WebDriver {
    * implementation.
    * @override
    */
-  setFileDetector() {}
+  setFileDetector() { }
 
   /**
    * Schedules a command to launch Chrome App with given ID.
@@ -709,127 +722,6 @@ class Driver extends webdriver.WebDriver {
   }
 
   /**
-   * Creates a new WebSocket connection.
-   * @return {!Promise<resolved>} A new CDP instance.
-   */
-  async createCDPConnection(target) {
-    const caps = await this.getCapabilities()
-    const seOptions = caps['map_'].get('se:options') || new Map()
-    const vendorInfo =
-      caps['map_'].get(this.VENDOR_COMMAND_PREFIX + ':chromeOptions') ||
-      new Map()
-    const debuggerUrl = seOptions['cdp'] || vendorInfo['debuggerAddress']
-    this._wsUrl = await this.getWsUrl(debuggerUrl, target)
-
-    return new Promise((resolve, reject) => {
-      try {
-        this._wsConnection = new WebSocket(this._wsUrl)
-      } catch (err) {
-        reject(err)
-        return
-      }
-
-      this._wsConnection.on('open', () => {
-        this._cdpConnection = new cdp.CdpConnection(this._wsConnection)
-        resolve(this._cdpConnection)
-      })
-
-      this._wsConnection.on('error', (error) => {
-        reject(error)
-      })
-    })
-  }
-
-  /**
-   * Retrieves 'webSocketDebuggerUrl' by sending a http request using debugger address
-   * @param {string} debuggerAddress
-   * @param {string} target
-   * @return {string} Returns parsed webSocketDebuggerUrl obtained from the http request
-   */
-  async getWsUrl(debuggerAddress, target) {
-    if (target && cdpTargets.indexOf(target.toLowerCase()) === -1) {
-      throw new error.InvalidArgumentError('invalid target value')
-    }
-    let path = '/json/version'
-
-    if (target === 'page') {
-      path = '/json'
-    }
-    let request = new http.Request('GET', path)
-    let client = new http.HttpClient('http://' + debuggerAddress)
-    let response = await client.send(request)
-    let url = JSON.parse(response.body)['webSocketDebuggerUrl']
-    if (target.toLowerCase() === 'page') {
-      url = JSON.parse(response.body)[0]['webSocketDebuggerUrl']
-    }
-
-    return url
-  }
-
-  /**
-   * Sets a listener for Fetch.authRequired event from CDP
-   * If event is triggered, it enter username and password
-   * and allows the test to move forward
-   * @param {string} username
-   * @param {string} password
-   * @param connection CDP Connection
-   */
-  async register(username, password, connection) {
-    await connection.execute("Network.setCacheDisabled", 1, {
-      cacheDisabled: true,
-    }, null);
-
-    this._wsConnection.on('message', (message) => {
-      const params = JSON.parse(message)
-
-      if (params.method === 'Fetch.authRequired') {
-        const requestParams = params['params']
-        connection.execute('Fetch.continueWithAuth', 1, {
-          requestId: requestParams['requestId'],
-          authChallengeResponse: {
-            response: 'ProvideCredentials',
-            username: username,
-            password: password,
-        }})
-      } else if (params.method === 'Fetch.requestPaused') {
-        const requestPausedParams = params['params']
-        connection.execute('Fetch.continueRequest', 1, {
-          requestId: requestPausedParams['requestId'],
-        })
-      }
-    })
-
-    await connection.execute('Fetch.enable', 1, {
-      handleAuthRequests: true,
-    }, null)
-  }
-
-  /**
-   *
-   * @param connection
-   * @param callback
-   * @returns {Promise<void>}
-   */
-  async onLogEvent(connection, callback) {
-    await connection.execute('Runtime.enable', 1, {}, null)
-
-    this._wsConnection.on('message', (message) => {
-      const params = JSON.parse(message)
-
-      if (params.method === 'Runtime.consoleAPICalled') {
-        const consoleEventParams = params['params']
-        let event = {
-          type: consoleEventParams['type'],
-          timestamp: new Date(consoleEventParams['timestamp']),
-          args: consoleEventParams['args']
-        }
-
-        callback(event)
-      }
-    })
-  }
-
-  /**
    * Set a permission state to the given value.
    *
    * @param {string} name A name of the permission to update.
@@ -847,29 +739,6 @@ class Driver extends webdriver.WebDriver {
     )
   }
 
-  /**
-   *
-   * @param connection
-   * @param callback
-   * @returns {Promise<void>}
-   */
-  async onLogException(connection, callback) {
-    await connection.execute('Runtime.enable', 1, {}, null)
-
-    this._wsConnection.on('message', (message) => {
-      const params = JSON.parse(message)
-
-      if (params.method === 'Runtime.exceptionThrown') {
-        const exceptionEventParams = params['params']
-        let event = {
-          exceptionDetails: exceptionEventParams['exceptionDetails'],
-          timestamp: new Date(exceptionEventParams['timestamp']),
-        }
-
-        callback(event)
-      }
-    })
-  }
   /**
    * Sends a DevTools command to change the browser's download directory.
    *

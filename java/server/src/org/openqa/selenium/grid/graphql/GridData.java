@@ -20,21 +20,30 @@ package org.openqa.selenium.grid.graphql;
 import graphql.schema.DataFetcher;
 import graphql.schema.DataFetchingEnvironment;
 import org.openqa.selenium.grid.distributor.Distributor;
+import org.openqa.selenium.grid.sessionqueue.NewSessionQueue;
 import org.openqa.selenium.internal.Require;
 
 import java.net.URI;
 
-public class GridData implements DataFetcher {
+public class GridData implements DataFetcher<Grid> {
   private final Distributor distributor;
+  private final NewSessionQueue newSessionQueue;
   private final URI publicUri;
+  private final String version;
 
-  public GridData(Distributor distributor, URI publicUri) {
+  public GridData(
+    Distributor distributor,
+    NewSessionQueue newSessionQueue,
+    URI publicUri,
+    String version) {
     this.distributor = Require.nonNull("Distributor", distributor);
     this.publicUri = Require.nonNull("Grid's public URI", publicUri);
+    this.newSessionQueue = Require.nonNull("New session queue", newSessionQueue);
+    this.version = Require.nonNull("Grid's version", version);
   }
 
   @Override
-  public Object get(DataFetchingEnvironment environment) {
-    return new Grid(distributor, publicUri);
+  public Grid get(DataFetchingEnvironment environment) {
+    return new Grid(distributor, newSessionQueue, publicUri, version);
   }
 }

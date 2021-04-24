@@ -17,13 +17,19 @@
 
 package org.openqa.selenium.testing.drivers;
 
+import org.openqa.selenium.Platform;
+import org.openqa.selenium.build.BazelBuild;
+import org.openqa.selenium.build.DevMode;
+import org.openqa.selenium.build.InProject;
 import org.openqa.selenium.net.NetworkUtils;
 import org.openqa.selenium.net.PortProber;
 import org.openqa.selenium.net.UrlChecker;
 import org.openqa.selenium.os.CommandLine;
 
+import java.io.File;
 import java.net.MalformedURLException;
 import java.net.URL;
+import java.nio.file.Path;
 import java.util.logging.Logger;
 import java.util.stream.Stream;
 
@@ -60,9 +66,21 @@ public class OutOfProcessSeleniumServer {
     String localAddress = new NetworkUtils().getPrivateLocalAddress();
     baseUrl = String.format("http://%s:%d", localAddress, port);
 
-    command = new CommandLine("java", Stream.concat(
-        Stream.of("-jar", serverJar, mode, "--port", String.valueOf(port)),
-        Stream.of(extraFlags)).toArray(String[]::new));
+    // Make sure we inherit system properties.
+    Stream<String> javaFlags = System.getProperties().entrySet().stream()
+      .filter(entry -> {
+        String key = String.valueOf(entry.getKey());
+        return key.startsWith("selenium") || key.startsWith("webdriver");
+      })
+      .map(entry -> "-D" + entry.getKey() + "=" + entry.getValue());
+
+    command = new CommandLine("java", Stream.concat(javaFlags, Stream.concat(
+      Stream.of("-jar", serverJar, mode, "--port", String.valueOf(port)),
+      Stream.of(extraFlags))).toArray(String[]::new));
+    if (Platform.getCurrent().is(Platform.WINDOWS)) {
+      File workingDir = findBinRoot(new File(".").getAbsoluteFile());
+      command.setWorkingDirectory(workingDir.getAbsolutePath());
+    }
 
     command.copyOutputTo(System.err);
     log.info("Starting selenium server: " + command.toString());
@@ -71,7 +89,7 @@ public class OutOfProcessSeleniumServer {
     try {
       URL url = new URL(baseUrl + "/status");
       log.info("Waiting for server status on URL " + url);
-      new UrlChecker().waitUntilAvailable(5, SECONDS, url);
+      new UrlChecker().waitUntilAvailable(10, SECONDS, url);
       log.info("Server is ready");
     } catch (UrlChecker.TimeoutException e) {
       log.severe("Server failed to start: " + e.getMessage());
@@ -88,6 +106,14 @@ public class OutOfProcessSeleniumServer {
     return this;
   }
 
+  private File findBinRoot(File dir) {
+    if ("bin".equals(dir.getName())) {
+      return dir;
+    } else {
+      return findBinRoot(dir.getParentFile());
+    }
+  }
+
   public void stop() {
     if (command == null) {
       return;
@@ -99,6 +125,19 @@ public class OutOfProcessSeleniumServer {
   }
 
   private String buildServerAndClasspath() {
+    if (DevMode.isInDevMode()) {
+      Path serverJar = InProject.locate(
+        "bazel-bin/java/server/src/org/openqa/selenium/grid/selenium_server_deploy.jar");
+      if (serverJar == null) {
+        new BazelBuild().build("grid");
+        serverJar = InProject.locate(
+          "bazel-bin/java/server/src/org/openqa/selenium/grid/selenium_server_deploy.jar");
+      }
+      if (serverJar != null) {
+        return serverJar.toAbsolutePath().toString();
+      }
+    }
+
     if (System.getProperty("selenium.browser.remote.path") != null) {
       return System.getProperty("selenium.browser.remote.path");
     }

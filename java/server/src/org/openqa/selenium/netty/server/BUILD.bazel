@@ -5,6 +5,7 @@ java_library(
     name = "server",
     srcs = glob(["*.java"]),
     visibility = [
+        "//java/client/test/org/openqa/selenium:__subpackages__",
         "//java/server/src/org/openqa/selenium/grid:__subpackages__",
         "//java/server/src/org/openqa/selenium/netty/server:__pkg__",
         "//java/server/src/org/openqa/selenium/remote/server:__pkg__",
@@ -16,6 +17,7 @@ java_library(
     ],
     deps = [
         "//java/client/src/org/openqa/selenium:core",
+        "//java/client/src/org/openqa/selenium/remote",
         "//java/client/src/org/openqa/selenium/remote/http",
         "//java/server/src/org/openqa/selenium/grid/server",
         "//java/server/src/org/openqa/selenium/grid/web",

@@ -17,14 +17,28 @@
 
 package org.openqa.selenium.remote.tracing;
 
-import io.opentelemetry.OpenTelemetry;
+import io.opentelemetry.context.propagation.ContextPropagators;
+import io.opentelemetry.sdk.OpenTelemetrySdk;
+import io.opentelemetry.sdk.trace.SdkTracerProvider;
 import org.openqa.selenium.remote.tracing.opentelemetry.OpenTelemetryTracer;
 
 public class DefaultTestTracer {
 
   public static Tracer createTracer() {
+    ContextPropagators propagators = ContextPropagators.noop();
+    SdkTracerProvider sdkTracerProvider = SdkTracerProvider.builder()
+      .build();
+
+    OpenTelemetrySdk openTelemetrySdk = OpenTelemetrySdk.builder()
+      .setTracerProvider(sdkTracerProvider)
+      .setPropagators(propagators)
+      .build();
+
+    Runtime.getRuntime()
+      .addShutdownHook(new Thread(sdkTracerProvider::close));
+
     return new OpenTelemetryTracer(
-      OpenTelemetry.getTracerProvider().get("default"),
-      OpenTelemetry.getPropagators().getTextMapPropagator());
+      openTelemetrySdk.getTracer("test"),
+      propagators.getTextMapPropagator());
   }
 }

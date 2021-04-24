@@ -20,6 +20,7 @@ package org.openqa.selenium.grid.distributor;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import org.openqa.selenium.Capabilities;
+import org.openqa.selenium.RetrySessionRequestException;
 import org.openqa.selenium.SessionNotCreatedException;
 import org.openqa.selenium.grid.data.CreateSessionRequest;
 import org.openqa.selenium.grid.data.CreateSessionResponse;
@@ -33,9 +34,10 @@ import org.openqa.selenium.grid.node.Node;
 import org.openqa.selenium.grid.security.RequiresSecretFilter;
 import org.openqa.selenium.grid.security.Secret;
 import org.openqa.selenium.grid.sessionmap.SessionMap;
+import org.openqa.selenium.grid.sessionqueue.SessionRequest;
+import org.openqa.selenium.internal.Either;
 import org.openqa.selenium.internal.Require;
 import org.openqa.selenium.json.Json;
-import org.openqa.selenium.remote.NewSessionPayload;
 import org.openqa.selenium.remote.SessionId;
 import org.openqa.selenium.remote.http.HttpClient;
 import org.openqa.selenium.remote.http.HttpRequest;
@@ -51,33 +53,26 @@ import org.openqa.selenium.remote.tracing.Status;
 import org.openqa.selenium.remote.tracing.Tracer;
 import org.openqa.selenium.status.HasReadyState;
 
-import java.io.IOException;
-import java.io.Reader;
 import java.io.UncheckedIOException;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
-import java.util.Objects;
-import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Predicate;
-import java.util.function.Supplier;
+import java.util.logging.Logger;
 import java.util.stream.Collectors;
 
 import static org.openqa.selenium.remote.RemoteTags.CAPABILITIES;
 import static org.openqa.selenium.remote.RemoteTags.CAPABILITIES_EVENT;
 import static org.openqa.selenium.remote.RemoteTags.SESSION_ID;
 import static org.openqa.selenium.remote.RemoteTags.SESSION_ID_EVENT;
-import static org.openqa.selenium.remote.http.Contents.bytes;
-import static org.openqa.selenium.remote.http.Contents.reader;
 import static org.openqa.selenium.remote.http.Route.delete;
 import static org.openqa.selenium.remote.http.Route.get;
 import static org.openqa.selenium.remote.http.Route.post;
-import static org.openqa.selenium.remote.tracing.HttpTracing.newSpanAsChildOf;
 import static org.openqa.selenium.remote.tracing.Tags.EXCEPTION;
 
 /**
@@ -118,6 +113,8 @@ import static org.openqa.selenium.remote.tracing.Tags.EXCEPTION;
  */
 public abstract class Distributor implements HasReadyState, Predicate<HttpRequest>, Routable {
 
+  private static final Logger LOG = Logger.getLogger(Distributor.class.getName());
+
   private final Route routes;
   protected final Tracer tracer;
   private final SlotSelector slotSelector;
@@ -141,57 +138,53 @@ public abstract class Distributor implements HasReadyState, Predicate<HttpReques
 
     Json json = new Json();
     routes = Route.combine(
-      post("/session").to(() -> req -> {
-        CreateSessionResponse sessionResponse = newSession(req);
-        return new HttpResponse().setContent(bytes(sessionResponse.getDownstreamEncodedResponse()));
-      }),
-      post("/se/grid/distributor/session")
-          .to(() -> new CreateSession(this))
-          .with(requiresSecret),
       post("/se/grid/distributor/node")
-          .to(() -> new AddNode(tracer, this, json, httpClientFactory, registrationSecret))
+          .to(() ->
+                new AddNode(tracer, this, json, httpClientFactory, registrationSecret))
           .with(requiresSecret),
       post("/se/grid/distributor/node/{nodeId}/drain")
-          .to((Map<String, String> params) -> new DrainNode(this, new NodeId(UUID.fromString(params.get("nodeId")))))
+          .to((Map<String, String> params) ->
+                new DrainNode(this, new NodeId(UUID.fromString(params.get("nodeId")))))
           .with(requiresSecret),
       delete("/se/grid/distributor/node/{nodeId}")
-          .to(params -> new RemoveNode(this, new NodeId(UUID.fromString(params.get("nodeId")))))
+          .to(params ->
+                new RemoveNode(this, new NodeId(UUID.fromString(params.get("nodeId")))))
           .with(requiresSecret),
       get("/se/grid/distributor/status")
           .to(() -> new GetDistributorStatus(this))
           .with(new SpanDecorator(tracer, req -> "distributor.status")));
   }
 
-  public CreateSessionResponse newSession(HttpRequest request)
-      throws SessionNotCreatedException {
+  public Either<SessionNotCreatedException, CreateSessionResponse> newSession(SessionRequest request)
+    throws SessionNotCreatedException {
+    Require.nonNull("Requests to process", request);
 
-    Span span = newSpanAsChildOf(tracer, request, "distributor.new_session");
+    Span span = tracer.getCurrentContext().createSpan("distributor.create_session_response");
     Map<String, EventAttributeValue> attributeMap = new HashMap<>();
-    try (
-      Reader reader = reader(request);
-      NewSessionPayload payload = NewSessionPayload.create(reader)) {
-      Objects.requireNonNull(payload, "Requests to process must be set.");
-
+    try {
       attributeMap.put(AttributeKey.LOGGER_CLASS.getKey(),
         EventAttribute.setValue(getClass().getName()));
 
-      Iterator<Capabilities> iterator = payload.stream().iterator();
-      attributeMap.put("request.payload", EventAttribute.setValue(payload.toString()));
-      span.addEvent("Session request received by the distributor", attributeMap);
+      Iterator<Capabilities> iterator = request.getDesiredCapabilities().iterator();
+      attributeMap.put("request.payload", EventAttribute.setValue(request.getDesiredCapabilities().toString()));
+      String sessionReceivedMessage = "Session request received by the distributor";
+      span.addEvent(sessionReceivedMessage, attributeMap);
+      LOG.info(String.format("%s: \n %s", sessionReceivedMessage, request.getDesiredCapabilities()));
 
       if (!iterator.hasNext()) {
-        SessionNotCreatedException exception = new SessionNotCreatedException("No capabilities found");
+        SessionNotCreatedException exception =
+          new SessionNotCreatedException("No capabilities found in session request payload");
         EXCEPTION.accept(attributeMap, exception);
         attributeMap.put(AttributeKey.EXCEPTION_MESSAGE.getKey(),
-          EventAttribute.setValue("Unable to create session. No capabilities found: "
-            + exception.getMessage()));
+          EventAttribute.setValue("Unable to create session. No capabilities found: " +
+            exception.getMessage()));
         span.addEvent(AttributeKey.EXCEPTION_EVENT.getKey(), attributeMap);
-        throw exception;
+        return Either.left(exception);
       }
 
-      Optional<Supplier<CreateSessionResponse>> selected;
+      Either<SessionNotCreatedException, CreateSessionResponse> selected;
       CreateSessionRequest firstRequest = new CreateSessionRequest(
-        payload.getDownstreamDialects(),
+        request.getDownstreamDialects(),
         iterator.next(),
         ImmutableMap.of("span", span));
 
@@ -200,51 +193,67 @@ public abstract class Distributor implements HasReadyState, Predicate<HttpReques
       try {
         Set<NodeStatus> model = ImmutableSet.copyOf(getAvailableNodes());
 
-        // Find a host that supports the capabilities present in the new session
+        // Reject new session immediately if no node has the required capabilities
+        boolean hostsWithCaps = model.stream()
+          .anyMatch(nodeStatus -> nodeStatus.hasCapability(firstRequest.getCapabilities()));
+
+        if (!hostsWithCaps) {
+          String errorMessage = String.format(
+            "No Node supports the required capabilities: %s",
+            request.getDesiredCapabilities().stream().map(Capabilities::toString)
+              .collect(Collectors.joining(", ")));
+          SessionNotCreatedException exception = new SessionNotCreatedException(errorMessage);
+          span.setAttribute(AttributeKey.ERROR.getKey(), true);
+          span.setStatus(Status.ABORTED);
+
+          EXCEPTION.accept(attributeMap, exception);
+          attributeMap.put(AttributeKey.EXCEPTION_MESSAGE.getKey(),
+            EventAttribute.setValue("Unable to create session: " + exception.getMessage()));
+          span.addEvent(AttributeKey.EXCEPTION_EVENT.getKey(), attributeMap);
+          return Either.left(exception);
+        }
+
+        // Find a Node that supports the capabilities present in the new session
         Set<SlotId> slotIds = slotSelector.selectSlot(firstRequest.getCapabilities(), model);
         if (!slotIds.isEmpty()) {
-          selected = Optional.of(reserve(slotIds.iterator().next(), firstRequest));
+          selected = reserve(slotIds.iterator().next(), firstRequest);
         } else {
-          selected = Optional.empty();
+          String errorMessage =
+            String.format(
+              "Unable to find provider for session: %s",
+              request.getDesiredCapabilities().stream().map(Capabilities::toString)
+                .collect(Collectors.joining(", ")));
+          SessionNotCreatedException exception = new RetrySessionRequestException(errorMessage);
+          selected = Either.left(exception);
         }
       } finally {
         writeLock.unlock();
       }
 
-      CreateSessionResponse sessionResponse = selected
-        .orElseThrow(
-          () -> {
-            span.setAttribute("error", true);
-            SessionNotCreatedException
-              exception =
-              new SessionNotCreatedException(
-                "Unable to find provider for session: " + payload.stream()
-                  .map(Capabilities::toString).collect(Collectors.joining(", ")));
-            EXCEPTION.accept(attributeMap, exception);
-            attributeMap.put(AttributeKey.EXCEPTION_MESSAGE.getKey(),
-              EventAttribute.setValue(
-                "Unable to find provider for session: "
-                  + exception.getMessage()));
-            span.addEvent(AttributeKey.EXCEPTION_EVENT.getKey(), attributeMap);
-            return exception;
-          })
-        .get();
+      if (selected.isRight()) {
+        CreateSessionResponse sessionResponse = selected.right();
 
-      sessions.add(sessionResponse.getSession());
+        sessions.add(sessionResponse.getSession());
+        SessionId sessionId = sessionResponse.getSession().getId();
+        Capabilities caps = sessionResponse.getSession().getCapabilities();
+        String sessionUri = sessionResponse.getSession().getUri().toString();
+        SESSION_ID.accept(span, sessionId);
+        CAPABILITIES.accept(span, caps);
+        SESSION_ID_EVENT.accept(attributeMap, sessionId);
+        CAPABILITIES_EVENT.accept(attributeMap, caps);
+        span.setAttribute(AttributeKey.SESSION_URI.getKey(), sessionUri);
+        attributeMap.put(AttributeKey.SESSION_URI.getKey(), EventAttribute.setValue(sessionUri));
 
-      SessionId sessionId = sessionResponse.getSession().getId();
-      Capabilities caps = sessionResponse.getSession().getCapabilities();
-      String sessionUri = sessionResponse.getSession().getUri().toString();
-      SESSION_ID.accept(span, sessionId);
-      CAPABILITIES.accept(span, caps);
-      SESSION_ID_EVENT.accept(attributeMap, sessionId);
-      CAPABILITIES_EVENT.accept(attributeMap, caps);
-      span.setAttribute(AttributeKey.SESSION_URI.getKey(), sessionUri);
-      attributeMap.put(AttributeKey.SESSION_URI.getKey(), EventAttribute.setValue(sessionUri));
+        String sessionCreatedMessage = "Session created by the distributor";
+        span.addEvent(sessionCreatedMessage, attributeMap);
+        LOG.info(String.format("%s. Id: %s, Caps: %s", sessionCreatedMessage, sessionId, caps));
+        return Either.right(sessionResponse);
 
-      return sessionResponse;
+      } else {
+        return selected;
+      }
     } catch (SessionNotCreatedException e) {
-      span.setAttribute("error", true);
+      span.setAttribute(AttributeKey.ERROR.getKey(), true);
       span.setStatus(Status.ABORTED);
 
       EXCEPTION.accept(attributeMap, e);
@@ -252,9 +261,9 @@ public abstract class Distributor implements HasReadyState, Predicate<HttpReques
         EventAttribute.setValue("Unable to create session: " + e.getMessage()));
       span.addEvent(AttributeKey.EXCEPTION_EVENT.getKey(), attributeMap);
 
-      throw e;
-    } catch (IOException e) {
-      span.setAttribute("error", true);
+      return Either.left(e);
+    } catch (UncheckedIOException e) {
+      span.setAttribute(AttributeKey.ERROR.getKey(), true);
       span.setStatus(Status.UNKNOWN);
 
       EXCEPTION.accept(attributeMap, e);
@@ -262,7 +271,7 @@ public abstract class Distributor implements HasReadyState, Predicate<HttpReques
         EventAttribute.setValue("Unknown error in LocalDistributor while creating session: " + e.getMessage()));
       span.addEvent(AttributeKey.EXCEPTION_EVENT.getKey(), attributeMap);
 
-      throw new SessionNotCreatedException(e.getMessage(), e);
+      return Either.left(new SessionNotCreatedException(e.getMessage(), e));
     } finally {
       span.close();
     }
@@ -278,7 +287,9 @@ public abstract class Distributor implements HasReadyState, Predicate<HttpReques
 
   protected abstract Set<NodeStatus> getAvailableNodes();
 
-  protected abstract Supplier<CreateSessionResponse> reserve(SlotId slot, CreateSessionRequest request);
+  protected abstract Either<SessionNotCreatedException, CreateSessionResponse> reserve(
+    SlotId slot,
+    CreateSessionRequest request);
 
   @Override
   public boolean test(HttpRequest httpRequest) {

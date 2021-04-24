@@ -46,6 +46,12 @@ public class V85Network extends Network<AuthRequired, RequestPaused> {
   }
 
   @Override
+  protected Command<Void> setUserAgentOverride(UserAgent userAgent) {
+    return org.openqa.selenium.devtools.v85.network.Network.setUserAgentOverride(
+      userAgent.userAgent(), userAgent.acceptLanguage(), userAgent.platform(), Optional.empty());
+  }
+
+  @Override
   protected Command<Void> enableNetworkCaching() {
     return org.openqa.selenium.devtools.v85.network.Network.setCacheDisabled(false);
   }
@@ -84,7 +90,7 @@ public class V85Network extends Network<AuthRequired, RequestPaused> {
       new AuthChallengeResponse(
         AuthChallengeResponse.Response.PROVIDECREDENTIALS,
         Optional.of(credentials.username()),
-        Optional.ofNullable(credentials.username())));
+        Optional.ofNullable(credentials.password())));
   }
 
   @Override
